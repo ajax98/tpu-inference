@@ -191,6 +191,11 @@ class MlaSchedule:
   k_idx: SmemWrapper  # [steps, batch]
   is_last_k: SmemWrapper  # [steps, batch]
   do_writeback: SmemWrapper  # [steps, batch]
+  # How many unpaged new tokens land in this block. The kernel gates its
+  # new-KV merge on this every grid step and used to re-derive it from
+  # kv_lens/cu_q_lens indirections plus ~8 ops per lane; `k_loop` already has
+  # it while building descriptors.
+  new_sz: SmemWrapper  # [steps, batch]
   dma_q: SmemWrapper  # [steps, batch, 2]
   dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
   dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
@@ -217,6 +222,7 @@ class MlaSchedule:
         k_idx=idx_wrapper,
         is_last_k=idx_wrapper,
         do_writeback=idx_wrapper,
+        new_sz=idx_wrapper,
         dma_q=SmemWrapper.create_shape_dtype(
             (effective_max_steps, cfgs.batch_size, 2)
         ),
@@ -288,6 +294,7 @@ def _mask_out_steps(
   schedule_smem.k_idx[step, b_idx] = 0
   schedule_smem.is_last_k[step, b_idx] = 0
   schedule_smem.do_writeback[step, b_idx] = 0
+  schedule_smem.new_sz[step, b_idx] = 0
   schedule_smem.dma_q[step, b_idx, 0] = 0
   schedule_smem.dma_q[step, b_idx, 1] = 0
 
@@ -518,6 +525,7 @@ def compute_metadata(
     q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
     do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
     schedule.do_writeback[step, target_lane] = do_writeback
+    schedule.new_sz[step, target_lane] = new_sz
 
     def fill_dma_kv_new(i, dma_sz, slot_start):
       dma_entry = schedule.dma_kv_new[step, target_lane, i]

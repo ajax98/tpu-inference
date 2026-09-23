@@ -484,22 +484,23 @@ def mla_body(
       processed_q_len.append((q_idx * cfgs.bq_sz + offset))
       processed_kv_len.append(k_id)
 
-      # Stitching metadata
-      kv_left = jnp.maximum(kv_len - k_id, 0)
-      kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-      kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
+      # `schedule.k_loop` already derived this while building the descriptors;
+      # re-deriving it here cost the indirections above plus ~8 ops per lane on
+      # every grid step, and the deficit against v2 is per-grid-step.
+      new_sz_list.append(schedule_ref.new_sz[step, b_idx])
 
-      bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
-      new_kv_len_start = q_end - kv_left_frm_new
+      # The remaining merge metadata is only read inside the gate below, which
+      # fires on one lane-step in three, so it is computed there rather than
+      # here. Deferred as thunks to keep the per-lane values bound.
+      def _merge_meta(kv_len=kv_len, k_id=k_id, q_len=q_len, q_end=q_end):
+        kv_left = jnp.maximum(kv_len - k_id, 0)
+        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
+        return (jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz),
+                q_end - kv_left_frm_new)
 
-      bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
-      new_kv_len_start_list.append(new_kv_len_start)
-      # Mirrors `schedule.k_loop`'s `new_sz`: how many unpaged new tokens land in
-      # this block. Zero for every step except the one holding the sequence's
-      # new token, which is what `gate_stitch` keys on.
-      new_sz_list.append(
-          jnp.minimum(cfgs.bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
-      )
+      bkv_sz_frm_cache_list.append(_merge_meta)
+      new_kv_len_start_list.append(None)
 
   # Skip the merge -- strided loads, roll, strided stores -- on lanes with no
   # new tokens. Only one step per sequence has any, so ~2/3 of lane-steps
@@ -510,14 +511,15 @@ def mla_body(
     @pl.when(new_sz_list[b_idx] > 0)
     def _stitch_and_store(b_idx=b_idx):
       with jax.named_scope("stitch_and_store"):
+        bkv_sz_frm_cache, new_kv_len_start = bkv_sz_frm_cache_list[b_idx]()
         stitch_utils.store_new_kv_lane(
             kv_in_vref,
             b_idx,
             stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
-                bkv_sz_frm_cache_list[b_idx],
-                new_kv_len_start_list[b_idx],
+                bkv_sz_frm_cache,
+                new_kv_len_start,
                 cfgs=cfgs,
             ),
             cfgs=cfgs,
