@@ -227,7 +227,7 @@ class MlaSchedule:
             (effective_max_steps, cfgs.batch_size, 2)
         ),
         dma_kv_cache=SmemWrapper.create_shape_dtype(
-            (effective_max_steps, cfgs.batch_size, max(1, cfgs.bkv_p_cache), 3)
+            (effective_max_steps, cfgs.batch_size, max(1, cfgs.bkv_p_cache), 2)
         ),
         dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
             (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_new),
@@ -247,11 +247,17 @@ class MlaSchedule:
       step: jax.typing.ArrayLike,
       batch_idx: jax.typing.ArrayLike,
       page_idx: jax.typing.ArrayLike,
-  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+  ) -> tuple[jax.Array, jax.Array]:
+    """Source page index and validity flag for one cached-KV page.
+
+    The VMEM destination is not stored: it is `page_idx * page_size`, a
+    compile-time constant, and the caller's loop index supplies it. It used to
+    occupy a third field and be read back on every grid step --
+    batch_size * bkv_p_cache times, 12 at batch=4, bkv=3.
+    """
     src_off = self.dma_kv_cache[step, batch_idx, page_idx, 0]
-    dst_off = self.dma_kv_cache[step, batch_idx, page_idx, 1]
-    sz = self.dma_kv_cache[step, batch_idx, page_idx, 2]
-    return src_off, dst_off, sz
+    sz = self.dma_kv_cache[step, batch_idx, page_idx, 1]
+    return src_off, sz
 
   def get_dma_q(
       self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
@@ -301,7 +307,6 @@ def _mask_out_steps(
   for i in range(schedule_smem.cfgs.bkv_p_cache):
     schedule_smem.dma_kv_cache[step, b_idx, i, 0] = 0
     schedule_smem.dma_kv_cache[step, b_idx, i, 1] = 0
-    schedule_smem.dma_kv_cache[step, b_idx, i, 2] = 0
 
   for i in range(schedule_smem.cfgs.bkv_p_new):
     dma_entry = schedule_smem.dma_kv_new[step, b_idx, i]
@@ -381,7 +386,7 @@ def _compute_waits(
       # SEQ_ALONG_LANE transfers whole pages, so the descriptors carry a
       # validity flag rather than a size and each valid one is `page_size`.
       for i in range(cfgs.bkv_p_cache):
-        _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
+        _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
         kv_in_tokens += dma_valid * cfgs.serve.page_size
       for i in range(cfgs.bkv_p_new):
         dma_entry = schedule.dma_kv_new[step, b, i]
@@ -510,9 +515,10 @@ def compute_metadata(
       hbm_p_idx = page_indices_ref[src_hbm_idx]
 
       schedule.dma_kv_cache[step, target_lane, i, 0] = hbm_p_idx
-      schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-      # Whole-page transfer: the third field is a validity flag, not a size.
-      schedule.dma_kv_cache[step, target_lane, i, 2] = jnp.where(
+      # Whole-page transfer: the second field is a validity flag, not a size.
+      # The VMEM destination is `i * page_size` and is recomputed by the
+      # reader rather than stored; see `get_dma_kv_cache`.
+      schedule.dma_kv_cache[step, target_lane, i, 1] = jnp.where(
           dma_sz > 0, 1, 0
       )
 

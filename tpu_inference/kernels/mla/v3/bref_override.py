@@ -164,10 +164,9 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       # 1. Fetch cached paged tokens from 3D HBM cache
       with jax.named_scope("fetch_paged_kv_cache"):
         for i in range(self.cfgs.bkv_p_cache):
-          hbm_p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
-              block_idx, b, i
-          )
-          dst_off = pl.multiple_of(dst_off, num_lanes)
+          hbm_p_idx, dma_valid = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+          # Compile-time constant: page i of the block lands at i * page_size.
+          dst_off = i * self.cfgs.serve.page_size
           sz = jnp.where(dma_valid == 1, self.cfgs.serve.page_size, 0)
           sz = pl.multiple_of(sz, num_lanes)
 
