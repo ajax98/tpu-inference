@@ -372,7 +372,6 @@ def _compute_waits(
   q_bytes_per_token = cfgs.q_bytes_per_token
   o_bytes_per_token = cfgs.o_bytes_per_token
   num_lanes = utils.get_tpu_num_lanes()
-  dma_chunk_size = num_lanes * 4
 
   @jax.named_scope("compute_waits")
   def body(step, _):
@@ -413,9 +412,10 @@ def _compute_waits(
     for b in range(cfgs.batch_size):
       _, q_sz = schedule.get_dma_q(step, b)
       q_in_tokens += q_sz
-    schedule.total_wait_q_in[step] = (
-        q_in_tokens * q_bytes_per_token
-    ) // dma_chunk_size
+    # Token counts, as for the KV totals: that is what the waiters need, and
+    # keeping the `* const` form lets Mosaic see the alignment (see the note in
+    # `BatchingQNopeRef.wait_in`).
+    schedule.total_wait_q_in[step] = q_in_tokens
 
     # O OUT
     o_out_tokens = 0
@@ -423,9 +423,7 @@ def _compute_waits(
       is_last_k = schedule.is_last_k[step, b] == 1
       _, q_sz = schedule.get_dma_q(step, b)
       o_out_tokens += jnp.where(is_last_k, q_sz, 0)
-    schedule.total_wait_o_out[step] = (
-        o_out_tokens * o_bytes_per_token
-    ) // dma_chunk_size
+    schedule.total_wait_o_out[step] = o_out_tokens
 
   jax.lax.fori_loop(start_step, end_step, body, None)
 

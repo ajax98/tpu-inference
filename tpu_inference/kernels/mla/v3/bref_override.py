@@ -383,10 +383,9 @@ class BatchingQNopeRef(pltpu.BufferedRef):
     sem: Any = self.sem_recvs.at[slot]
     block_idx = grid_indices[0]
 
-    q_in_tokens = 0
-    for b in range(self.cfgs.batch_size):
-      _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-      q_in_tokens += q_sz
+    # Summed by the schedule when it built the q descriptors; this loop
+    # re-read `batch_size` of them on every grid step.
+    q_in_tokens = schedule_ref.total_wait_q_in[block_idx]
 
     itemsize = jnp.dtype(self.cfgs.serve.dtype_q).itemsize
     # The minormost dimension of the u32 view, which the reshape below must
@@ -488,10 +487,9 @@ class BatchingQPeRef(pltpu.BufferedRef):
     sem: Any = self.sem_recvs.at[slot]
     block_idx = grid_indices[0]
 
-    q_in_tokens = 0
-    for b in range(self.cfgs.batch_size):
-      _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-      q_in_tokens += q_sz
+    # Summed by the schedule when it built the q descriptors; this loop
+    # re-read `batch_size` of them on every grid step.
+    q_in_tokens = schedule_ref.total_wait_q_in[block_idx]
 
     itemsize = jnp.dtype(self.cfgs.serve.dtype_q).itemsize
     dma_chunk_size = 128 * 4
@@ -601,11 +599,8 @@ class BatchingORef(pltpu.BufferedRef):
     )
     rows_per_token = o_bytes_per_token // (minor * 4)
     assert rows_per_token % 8 == 0
-    o_tokens = 0
-    for b in range(self.cfgs.batch_size):
-      is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
-      _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-      o_tokens += jnp.where(is_last_k, q_sz, 0)
+    # As above: precomputed by the schedule.
+    o_tokens = schedule_ref.total_wait_o_out[block_idx]
     wait_lanes = o_tokens * rows_per_token
     assert self.window_ref is not None
     vmem_src: Any = self.window_ref.at[slot]
