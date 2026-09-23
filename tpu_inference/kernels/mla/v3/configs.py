@@ -205,7 +205,20 @@ class ServingConfigs:
   #
   #   Corollary: the original `+2 * page_size` slack is load-bearing by
   #   accident. It is not waste, and trimming it to any power of two is a trap.
-  kv_slack_pad_lanes: int = 0
+  #   MEASURED again after the slack dropped to one page on decode. One page
+  #   leaves `bkv_sz + page_size` lanes, and (bkv+1)*page_size/128 is always
+  #   even, so the default landed exactly on the power-of-two trap above. A
+  #   single 128-lane pad flips the parity for any bkv at page_size=1024.
+  #   16 seqs, kv 9216, bkv=3, batch=4, kernel time:
+  #
+  #       pad=0    4096 lanes  /128 = 32  60.8 us   <- power of two
+  #       pad=128  4224        /128 = 33  60.1
+  #       pad=256  4352        /128 = 34  60.0
+  #
+  #   128 is the default rather than 256 because they measure the same and it
+  #   costs half the memory -- which matters: the slack is what decides
+  #   whether batch=8 fits in 64 MB of VMEM at all.
+  kv_slack_pad_lanes: int = 128
 
 
 
@@ -541,9 +554,15 @@ class MlaConfigs:
     The guard mirrors the condition `stitch_new_kv_lane` uses to select its
     O(1) path, so it cannot apply to a multi-token query block.
     """
+    # The second page is dead weight on decode, exactly as described above,
+    # and it is not free: at bkv=3/page=1024/batch=8 it is 10.5 MB of a 64 MB
+    # VMEM, which is what put `batch=8` 1.55 MB over the limit and forced
+    # batch=4 -- doubling the grid-step count that v3's remaining decode
+    # deficit is proportional to.
+    slack_pages = 1 if self.one_new_token else 2
     return (
         self.block.bkv_sz
-        + 2 * self.serve.page_size
+        + slack_pages * self.serve.page_size
         + self.serve.kv_slack_pad_lanes
     )
 
