@@ -21,9 +21,11 @@ from jax._src import dtypes
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 import tpu_inference.kernels.mla.v1.kernel as mla
+import tpu_inference.kernels.mla.v3.utils as mla_v3_utils
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference import utils
+from tpu_inference.kernels.mla import version as mla_version
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
@@ -65,7 +67,11 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
     if use_mla:
         # No assertion needed: MLA compresses all KV into a single latent vector,
         # so actual_num_kv_heads is never used in mla.get_kv_cache_shape().
-        get_kv_cache_shape_fn = mla.get_kv_cache_shape
+        # v3 puts tokens on lanes instead of sublanes, so its cache is the 3D
+        # transpose of v1/v2's; see kernels/mla/version.py.
+        get_kv_cache_shape_fn = (mla_v3_utils.get_kv_cache_shape
+                                 if mla_version.use_v3() else
+                                 mla.get_kv_cache_shape)
         shape = list(
             get_kv_cache_shape_fn(total_num_pages, block_size, actual_head_dim,
                                   kv_dtype))
@@ -124,9 +130,16 @@ def create_kv_caches(
     # block_size --> shard by context
     # head       --> shard by heads
     if use_mla:
-        sharding = NamedSharding(
-            mesh,
-            PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT))
+        if mla_version.use_v3():
+            # v3's cache is [pages, kv_dim, page_size]: the token axis is minor,
+            # not dim 1, so CONTEXT has to move with it. Sharding dim 1 here
+            # would split the latent dimension instead of the sequence.
+            mla_spec = PartitionSpec(ShardingAxisName.BATCH, None,
+                                     ShardingAxisName.CONTEXT)
+        else:
+            mla_spec = PartitionSpec(ShardingAxisName.BATCH,
+                                     ShardingAxisName.CONTEXT)
+        sharding = NamedSharding(mesh, mla_spec)
     else:
         sharding = NamedSharding(
             mesh,
