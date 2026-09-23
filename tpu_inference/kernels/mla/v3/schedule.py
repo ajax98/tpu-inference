@@ -383,9 +383,11 @@ def _compute_waits(
             dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
         )
 
-    schedule.total_wait_kv_in[step] = (
-        kv_in_tokens * kv_bytes_per_token
-    ) // dma_chunk_size
+    # Stored as a *token* count, which is what `bref_override.wait_in` needs
+    # to size its wait region. It previously held a DMA-chunk count and was
+    # never read by anything, while the waiter recomputed the same sum from 16
+    # SMEM descriptors on every grid step.
+    schedule.total_wait_kv_in[step] = kv_in_tokens
 
     # KV OUT
     kv_out_tokens = 0
@@ -397,9 +399,7 @@ def _compute_waits(
             do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
         )
 
-    schedule.total_wait_kv_out[step] = (
-        kv_out_tokens * kv_bytes_per_token
-    ) // dma_chunk_size
+    schedule.total_wait_kv_out[step] = kv_out_tokens
 
     # Q IN
     q_in_tokens = 0

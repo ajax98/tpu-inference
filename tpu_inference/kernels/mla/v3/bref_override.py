@@ -277,17 +277,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       sem: Any = self.sem_recvs.at[slot]
       block_idx = grid_indices[0]
 
-      kv_in_tokens: Any = jnp.int32(0)
-      for b in range(self.cfgs.batch_size):
-        for i in range(self.cfgs.bkv_p_cache):
-          _, _, dma_valid = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-          kv_in_tokens = kv_in_tokens + dma_valid * self.cfgs.serve.page_size
-        for i in range(self.cfgs.bkv_p_new):
-          dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-          kv_in_tokens = kv_in_tokens + jnp.where(
-              dma_entry.fetch_val > 0, self.cfgs.serve.page_size, 0
-          )
-      kv_in_tokens = pl.multiple_of(jnp.asarray(kv_in_tokens), 128)
+      # The schedule already summed this when it built the descriptors. This
+      # used to re-derive it from batch_size * (bkv_p_cache + bkv_p_new) SMEM
+      # reads on every grid step -- 16 at batch=4, bkv=3 -- which is per-step
+      # work v2 does not do, and the deficit against v2 is per-grid-step.
+      kv_in_tokens = pl.multiple_of(
+          jnp.asarray(schedule_ref.total_wait_kv_in[block_idx]), 128
+      )
 
       assert self.window_ref is not None
       vmem_dst: Any = self.window_ref.at[slot]
@@ -306,15 +302,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       sem: Any = self.sem_sends.at[slot]
       block_idx = grid_indices[0]
 
-      kv_out_tokens: Any = jnp.int32(0)
-      for b in range(self.cfgs.batch_size):
-        do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
-        for i in range(self.cfgs.bkv_p_new):
-          dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-          kv_out_tokens = kv_out_tokens + jnp.where(
-              do_writeback & (dma_entry.wb_val > 0), self.cfgs.serve.page_size, 0
-          )
-      kv_out_tokens = pl.multiple_of(jnp.asarray(kv_out_tokens), 128)
+      # As in `wait_in`: precomputed by the schedule.
+      kv_out_tokens = pl.multiple_of(
+          jnp.asarray(schedule_ref.total_wait_kv_out[block_idx]), 128
+      )
 
       assert self.window_ref is not None
       vmem_src: Any = self.window_ref.at[slot]
