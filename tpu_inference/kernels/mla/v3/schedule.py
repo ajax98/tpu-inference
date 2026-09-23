@@ -529,7 +529,21 @@ def compute_metadata(
     q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
     do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
     schedule.do_writeback[step, target_lane] = do_writeback
-    schedule.new_sz[step, target_lane] = new_sz
+    # What the kernel actually needs is "is a merge required", not "how many
+    # new tokens". The staged run lands at
+    #   src_tok = cache_pages * page_size + (hbm_token_idx_base % page_size)
+    # and belongs at `bkv_sz_cache`. When those coincide -- which they do for
+    # the first k-block of a fresh prefill, both 0 -- the roll shift is zero
+    # and the merge is an identity copy of the whole block. Storing 0 there
+    # elides it via the gate the kernel already has.
+    _cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
+    _src_tok = (
+        _cache_pages * cfgs.serve.page_size
+        + ((q_end - kv_left_frm_new) % cfgs.serve.page_size)
+    )
+    schedule.new_sz[step, target_lane] = jnp.where(
+        _src_tok == bkv_sz_cache, 0, new_sz
+    )
 
     def fill_dma_kv_new(i, dma_sz, slot_start):
       dma_entry = schedule.dma_kv_new[step, target_lane, i]

@@ -108,7 +108,10 @@ def mode_configs(
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     p_same_dtype_as_v: bool = False,
-    kv_slack_pad_lanes: int = 0,
+    # None defers to `ServingConfigs.kv_slack_pad_lanes`, which defaults to
+    # 128 to keep `kv_vmem_lanes // 128` off a power of two. Hardcoding 0 here
+    # silently overrode that default and cost 1.2% on decode.
+    kv_slack_pad_lanes: int | None = None,
     q_split: int = 1,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
 ) -> dict[configs.MlaCase, configs.MlaConfigs]:
@@ -153,7 +156,8 @@ def mode_configs(
       scale_v=v_scale,
       kv_layout=kv_layout,
       p_same_dtype_as_v=p_same_dtype_as_v,
-      kv_slack_pad_lanes=kv_slack_pad_lanes,
+      **({} if kv_slack_pad_lanes is None
+         else dict(kv_slack_pad_lanes=kv_slack_pad_lanes)),
   )
   default_decode, default_prefill = calculate_block_sizes(
       serve_cfgs,
@@ -236,7 +240,10 @@ def mla_ragged_paged_attention(
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     p_same_dtype_as_v: bool = False,
-    kv_slack_pad_lanes: int = 0,
+    # None defers to `ServingConfigs.kv_slack_pad_lanes`, which defaults to
+    # 128 to keep `kv_vmem_lanes // 128` off a power of two. Hardcoding 0 here
+    # silently overrode that default and cost 1.2% on decode.
+    kv_slack_pad_lanes: int | None = None,
     q_split: int = 1,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
     schedules: dict[configs.MlaCase, schedule.MlaSchedule] | None = None,
@@ -281,7 +288,8 @@ def mla_ragged_paged_attention(
       prefill_block_sizes=prefill_block_sizes,
       vmem_limit_bytes=vmem_limit_bytes,
       p_same_dtype_as_v=p_same_dtype_as_v,
-      kv_slack_pad_lanes=kv_slack_pad_lanes,
+      **({} if kv_slack_pad_lanes is None
+         else dict(kv_slack_pad_lanes=kv_slack_pad_lanes)),
       q_split=q_split,
       kv_layout=kv_layout,
   )
@@ -370,23 +378,24 @@ def mla_ragged_paged_attention(
 
   # `distribution` splits the batch into decode / prefill / mixed bands. Each
   # gets its own pass, chaining `ql_nope_prep` and `cache_kv` so later passes
-  # see earlier writes. The cond costs 0.053 ms on decode_f8_kv9216; v2 avoids
-  # it by sizing each pass's grid zero-trip instead (v2/kernel.py:2511).
-  passes = [
-      (configs.MlaCase.DECODE, distribution[0] > 0),
-      (configs.MlaCase.PREFILL, distribution[1] - distribution[0] > 0),
-      (configs.MlaCase.MIXED, distribution[2] - distribution[1] > 0),
-  ]
-
-  carry = (ql_nope_prep, cache_kv)
-  for mode, predicate in passes:
-    carry = lax.cond(
-        predicate,
-        lambda q_kv, m=mode: run_mla_kernel(m, q_kv[0], q_kv[1]),
-        lambda q_kv: q_kv,
-        carry,
-    )
-  o_hbm, cache_kv = carry
+  # see earlier writes.
+  #
+  # These used to be guarded by `lax.cond` on whether the band was non-empty,
+  # at 0.053 ms per call -- 61 layers deep that is ~3.2 ms per decode step
+  # against a ~34 ms TPOT, and it is the single largest v2/v3 difference
+  # end to end, larger than every kernel delta combined.
+  #
+  # The guard was never needed. The kernel is already zero-trip on an empty
+  # band: `num_safe_step_iterations = cdiv(actual_steps, max_steps_ub)` is 0
+  # and `pl.loop(0, 0)` runs nothing. What the cond cost was its *carry* --
+  # both branches must yield `(ql_nope, cache_kv)`, and `cache_kv` is the
+  # whole KV cache, so the conditional forced it through a select. v2 reaches
+  # the same place by sizing each pass zero-trip and paying ~0.9 us for the
+  # passes that do nothing (v2/kernel.py:2511).
+  o_hbm, cache_kv = ql_nope_prep, cache_kv
+  for mode in (configs.MlaCase.DECODE, configs.MlaCase.PREFILL,
+               configs.MlaCase.MIXED):
+    o_hbm, cache_kv = run_mla_kernel(mode, o_hbm, cache_kv)
 
   output = kernel.prepare_outputs(
       o_hbm,

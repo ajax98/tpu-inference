@@ -34,6 +34,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tpu_inference.kernels.mla.v3 import configs
+from tpu_inference.kernels.mla.v3 import utils
 
 
 def _stitch_decode_lane(
@@ -87,35 +88,50 @@ def _stitch_prefill_lane(
     *,
     cfgs: configs.MlaConfigs,
 ):
-  """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
-  total_head_words = cfgs.aligned_kv_dim // cfgs.serve.packing_kv
-  num_sublanes = pltpu.get_tpu_info().num_sublanes
-  words_per_sublane = total_head_words // num_sublanes
-  vmem_u32_reshaped = vmem_u32_ref.reshape(
-      words_per_sublane, num_sublanes, v_len
+  """Prefill path: roll only the window the new tokens occupy.
+
+  This used to roll the *entire* staging buffer -- `reshape(words, sublanes,
+  v_len)` then `pltpu.roll(..., axis=2)` over all `v_len` lanes -- to move at
+  most `bkv_sz` tokens. At prefill that is 160 x 8 x 3200 u32 = 16 MB of
+  vector traffic per grid step, and a 1024-token prefill at bq_sz=16 is 64
+  steps. It is the reason v3's prefill measured 2-3.6x slower than v2's at
+  matched shapes.
+
+  The decode path beside this one already targets only the VREG holding the
+  stitch boundary. This applies the same idea: source and destination are each
+  a 128-aligned window wide enough for the moved run, so the rolled extent is
+  `bkv_sz + 128` rather than `v_len`, independent of the slack.
+
+  Returns the merged `[0, bkv_sz)` block, the same extent the caller wrote
+  before -- only the rolled *source* shrinks, from `v_len` to `bkv_sz + 128`.
+  """
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  # Destination is exactly the block, [0, bkv_sz) -- the same lanes the old
+  # whole-buffer version wrote, so nothing in the slack region (where pending
+  # new-KV DMAs land) is touched. Only the *source* needs a window, and it
+  # needs `bkv_sz + 128`: the run can be as long as the block, and 128 more
+  # covers a source that starts mid-group.
+  src_win_len = utils.align_to(cfgs.bkv_sz, num_lanes) + num_lanes
+  assert src_win_len <= v_len, (src_win_len, v_len)
+
+  src_tok = cache_pages * cfgs.serve.page_size + new_tok_offset
+  src_base = (src_tok // num_lanes) * num_lanes
+  src_base = pl.multiple_of(
+      jnp.minimum(src_base, v_len - src_win_len), num_lanes
   )
 
-  # The `% v_len` is required, not defensive: the difference is negative
-  # whenever the new tokens land at a higher lane index than the stitch
-  # boundary (`cache_pages` rounds `bkv_sz_cache` *up* to a page, so the source
-  # offset routinely exceeds the destination). `pltpu.roll` needs a
-  # non-negative shift, and rolling by `d` is congruent to rolling by
-  # `d % v_len` on a v_len-wide axis, so the mod maps it to the right one.
-  roll_shift = (
-      bkv_sz_cache - (cache_pages * cfgs.serve.page_size + new_tok_offset)
-  ) % v_len
-  rolled_u32 = pltpu.roll(vmem_u32_reshaped[...], roll_shift, axis=2)
+  dst_win = vmem_u32_ref[:, : cfgs.bkv_sz]
+  src_win = vmem_u32_ref[:, pl.ds(src_base, src_win_len)]
 
-  lane_idx = jax.lax.broadcasted_iota(
-      jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
-  )
-  merged_cache_u32 = jax.lax.select(
-      lane_idx >= bkv_sz_cache,
-      rolled_u32[..., : cfgs.bkv_sz],
-      vmem_u32_reshaped[..., : cfgs.bkv_sz],
-  )
+  # Align the staged run so that lane `bkv_sz_cache` of the rolled window
+  # holds the token at `src_tok`. Negative shifts are congruent mod the window
+  # width, and `pltpu.roll` requires non-negative.
+  shift = (bkv_sz_cache - (src_tok - src_base)) % src_win_len
+  rolled = pltpu.roll(src_win, shift, axis=1)[:, : cfgs.bkv_sz]
 
-  return merged_cache_u32
+  lane = jax.lax.broadcasted_iota(jnp.int32, dst_win.shape, 1)
+  merged = jax.lax.select(lane >= bkv_sz_cache, rolled, dst_win)
+  return merged
 
 
 
@@ -149,15 +165,11 @@ def store_new_kv_lane(
       )
       vmem_u32_ref[:, chunk_slice] = new_chunk
   else:
-    v_len = cfgs.kv_vmem_lanes
-    merged_cache_u32 = stitch_result
-    total_head_words = cfgs.aligned_kv_dim // cfgs.serve.packing_kv
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
-    words_per_sublane = total_head_words // num_sublanes
-    vmem_u32_reshaped = vmem_u32_ref.reshape(
-        words_per_sublane, num_sublanes, v_len
-    )
-    vmem_u32_reshaped[..., : cfgs.bkv_sz] = merged_cache_u32
+    # Prefill now returns a window rather than the whole buffer, so the store
+    # is a window store. Writing `[..., :bkv_sz]` here used to rewrite every
+    # lane of the block on every grid step to land at most `bkv_sz` moved
+    # tokens; see `_stitch_prefill_lane`.
+    vmem_u32_ref[:, : cfgs.bkv_sz] = stitch_result
 
 
 def stitch_new_kv_lane(
