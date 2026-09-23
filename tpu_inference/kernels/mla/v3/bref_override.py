@@ -174,11 +174,14 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
           # C_kv [:aligned_lkv_dim] and K_pe [aligned_lkv_dim:] are adjacent
           # and share source and destination lane slices, so one copy is
           # identical to the two below and halves the descriptor count.
-          pltpu.make_async_copy(
-              _tok_slice(kv_cache_hbm, hbm_p_idx, 0, sz),
-              _tok_slice(vmem_dst_lane, b, dst_off, sz),
-              sem,
-          ).start()
+          def _start_cache(hbm_p_idx=hbm_p_idx, dst_off=dst_off, sz=sz, b=b):
+            pltpu.make_async_copy(
+                _tok_slice(kv_cache_hbm, hbm_p_idx, 0, sz),
+                _tok_slice(vmem_dst_lane, b, dst_off, sz),
+                sem,
+            ).start()
+
+          _start_cache()
       # 2. Fetch unpaged new KV tokens from HBM
       with jax.named_scope("fetch_new_kv"):
         for i in range(self.cfgs.bkv_p_new):
@@ -190,6 +193,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
           dst_vmem_off = pl.multiple_of(dst_vmem_off, num_lanes)
           sz = pl.multiple_of(sz, num_lanes)
 
+          # Gating these on `fetch_val` -- only one step in three carries a
+          # new token at bkv=3 over 9 pages -- was measured and is a null
+          # result: bit-identical output, and the per-step deficit against v2
+          # was unchanged (+11.4/+6.7/+2.5 us ungated vs +11.5/+6.5/+2.6
+          # gated, at 48/24/12 steps). Zero-size DMAs are free to issue; the
+          # per-step cost is elsewhere.
           def _start_new_kv(
               src_new_off=src_new_off, dst_vmem_off=dst_vmem_off, sz=sz, b=b
           ):
