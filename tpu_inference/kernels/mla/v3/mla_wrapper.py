@@ -392,10 +392,38 @@ def mla_ragged_paged_attention(
   # whole KV cache, so the conditional forced it through a select. v2 reaches
   # the same place by sizing each pass zero-trip and paying ~0.9 us for the
   # passes that do nothing (v2/kernel.py:2511).
-  o_hbm, cache_kv = ql_nope_prep, cache_kv
-  for mode in (configs.MlaCase.DECODE, configs.MlaCase.PREFILL,
-               configs.MlaCase.MIXED):
-    o_hbm, cache_kv = run_mla_kernel(mode, o_hbm, cache_kv)
+  # `distribution` splits the batch into decode / prefill / mixed bands. Each
+  # gets its own pass, chaining `ql_nope_prep` and `cache_kv` so later passes
+  # see earlier writes.
+  #
+  # The comment that used to sit here said the cond costs 0.053 ms per call
+  # and that v2 avoids it by sizing each pass zero-trip. That was taken at
+  # face value and the guard removed; measured as a before/after it is the
+  # other way round. Pure decode, kv 9216, bkv=3, batch=4, wall clock:
+  #
+  #             guard present   guard removed
+  #     8 seqs      68.8 us         74.6 us
+  #    32 seqs     155.5           163.5
+  #   112 seqs     450.3           457.4
+  #
+  # Running the two empty passes as zero-trip pallas_calls costs 6-8 us more
+  # than the conditional it replaced, at every size. v3 already beat v2 with
+  # the guard in place (-1.7 / -9.7 / -10.8%). Keep the cond.
+  passes = [
+      (configs.MlaCase.DECODE, distribution[0] > 0),
+      (configs.MlaCase.PREFILL, distribution[1] - distribution[0] > 0),
+      (configs.MlaCase.MIXED, distribution[2] - distribution[1] > 0),
+  ]
+
+  carry = (ql_nope_prep, cache_kv)
+  for mode, predicate in passes:
+    carry = lax.cond(
+        predicate,
+        lambda q_kv, m=mode: run_mla_kernel(m, q_kv[0], q_kv[1]),
+        lambda q_kv: q_kv,
+        carry,
+    )
+  o_hbm, cache_kv = carry
 
   output = kernel.prepare_outputs(
       o_hbm,
