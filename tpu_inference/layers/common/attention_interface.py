@@ -28,6 +28,8 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
 
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+import os
+
 from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 import tpu_inference.kernels.mla.v3.configs as mla_v3_configs
@@ -504,7 +506,15 @@ _MLA_DECODE_BATCH_SIZE = 4
 # empty slot. 9/3 is exact; 9/2 leaves a half-empty fifth block. The same
 # sweep at kv 4096 (4 pages) picked bkv=4 for the same reason, and that is
 # also why bkv=4 lost in E2E when tried earlier -- 4 does not divide 9.
-_MLA_V3_DECODE_KV_PAGES = _MLA_KV_PAGES_PER_BLOCK[0]
+# `bkv` is expressed in *pages*, so the right value tracks the page size: at
+# page 1024 v2's 3 pages is 3072 tokens, and matching that token count at page
+# 256 needs 12. Overridable so a run can pair a page size with its block size
+# without a rebuild.
+# `or` rather than a get() default: the recipe passes an empty string when
+# unset, and int("") raises.
+_MLA_V3_DECODE_KV_PAGES = int(
+    os.environ.get("MLA_V3_DECODE_KV_PAGES") or _MLA_KV_PAGES_PER_BLOCK[0]
+)
 _MLA_V3_DECODE_N_BUFFER = 2
 _MLA_V3_DECODE_BATCH = _MLA_DECODE_BATCH_SIZE
 
