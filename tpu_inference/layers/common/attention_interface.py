@@ -28,9 +28,16 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
 
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+import os
+
 from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
+import tpu_inference.kernels.mla.v3.configs as mla_v3_configs
+import tpu_inference.kernels.mla.v3.mla_wrapper as mla_v3_wrapper
+from tpu_inference.kernels.mla import version as mla_version
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
+from tpu_inference.kernels.mla.v3.mla_wrapper import (
+    mla_ragged_paged_attention as mla_ragged_paged_attention_v3)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
@@ -476,6 +483,135 @@ def attention(
     return kv_cache, output
 
 
+# v2's production block sizes, as (decode, prefill, mixed). v3 is held to the
+# same tiling so a v2-vs-v3 delta reflects the kernel, not the tuning.
+_MLA_KV_PAGES_PER_BLOCK = (3, 1, 1)
+_MLA_QUERIES_PER_BLOCK = (1, 16, 16)
+_MLA_DECODE_BATCH_SIZE = 4
+# v3 decode matches v2's tiling, which measured as v3's optimum too.
+#
+# At the shape E2E actually decodes at -- 9 pages/seq (kv 9216), 16 q tokens,
+# from the HLO's page_indices s32[1008] over 112 slots -- sweeping bkv x batch
+# with 16 kernel calls per dispatch (so device time dominates), interleaved,
+# 5 reps:
+#
+#     bkv=3 batch=4   80.48 us  sd 0.49   <- this
+#     bkv=3 batch=2   85.79      0.26
+#     bkv=9 batch=2   86.87      2.23
+#     bkv=2 batch=8   90.32      0.62     <- previous setting, +10.9%
+#     bkv=2 batch=1  142.15     11.54
+#
+# The driver is partial-tail waste, not grid-step count: bkv must divide the
+# sequence length in pages or the last block carries real tokens in a mostly
+# empty slot. 9/3 is exact; 9/2 leaves a half-empty fifth block. The same
+# sweep at kv 4096 (4 pages) picked bkv=4 for the same reason, and that is
+# also why bkv=4 lost in E2E when tried earlier -- 4 does not divide 9.
+# `bkv` is expressed in *pages*, so the right value tracks the page size: at
+# page 1024 v2's 3 pages is 3072 tokens, and matching that token count at page
+# 256 needs 12. Overridable so a run can pair a page size with its block size
+# without a rebuild.
+# `or` rather than a get() default: the recipe passes an empty string when
+# unset, and int("") raises.
+_MLA_V3_DECODE_KV_PAGES = int(
+    os.environ.get("MLA_V3_DECODE_KV_PAGES") or _MLA_KV_PAGES_PER_BLOCK[0]
+)
+_MLA_V3_DECODE_N_BUFFER = 2
+_MLA_V3_DECODE_BATCH = _MLA_DECODE_BATCH_SIZE
+
+# Keyed on the identity of the metadata arrays, which are rebuilt every step.
+# Only ever holds the current step.
+_V3_SCHEDULE_CACHE: dict = {}
+
+
+def _v3_kernel_kwargs(page_size: int) -> dict:
+    """Block sizes for v3, mirroring v2's per-mode tuples.
+
+    v2 takes (decode, prefill, mixed) tuples; v3 takes a BlockSizes per pass, so
+    these are built explicitly rather than via v3's scalar defaults, which would
+    force a single num_kv_pages_per_block on both modes.
+    """
+    return dict(
+        decode_block_sizes=mla_v3_configs.BlockSizes(
+            bq_sz=1,
+            bq_c_sz=1,
+            # Left at v2's values deliberately. Sweeping bkv (1-6), batch
+            # (1-8) and n_buffer (2-4) at 8 and 112 seqs/device produced
+            # apparent wins of +2.0%, +6.1% and +5.0%, none of which survived a
+            # controlled A/B: interleaved repeats put n_buffer=4 at +0.23%
+            # against a 3.18% within-config sd, and the identical shipped config
+            # varied 0.3392 -> 0.3261 ms between jobs.
+            #
+            # Single-shot medians compared across jobs cannot resolve anything
+            # below ~4% here. There is no decode tiling win above that floor.
+            bkv_sz=_MLA_V3_DECODE_KV_PAGES * page_size,
+            batch_size=_MLA_V3_DECODE_BATCH,
+            n_buffer=_MLA_V3_DECODE_N_BUFFER,
+        ),
+        prefill_block_sizes=mla_v3_configs.BlockSizes(
+            bq_sz=_MLA_QUERIES_PER_BLOCK[1],
+            bq_c_sz=_MLA_QUERIES_PER_BLOCK[1],
+            bkv_sz=_MLA_KV_PAGES_PER_BLOCK[1] * page_size,
+            batch_size=1,
+            n_buffer=2,
+        ),
+        # Keeping P in V's dtype skips a cast before the PV matmul. The wrapper
+        # applies it to PREFILL/MIXED only -- on DECODE the score tile is a
+        # single MXU pass, so it buys nothing.
+        p_same_dtype_as_v=True,
+        # vLLM never populates the prefill band. Both places that set
+        # `request_distribution` write [num_decode, num_decode, num_reqs] --
+        # persistent_batch_manager.py, and tpu_runner.py for the DP path -- so
+        # `[d0, d1)` is empty on every step. The reorder only splits 1-token
+        # decodes from everything else, and everything else lands in mixed.
+        # Dropping the pass statically removes one schedule build per step and
+        # one kernel launch per layer; leaving it in costs both for a band that
+        # cannot be non-empty.
+        modes=(mla_v3_configs.MlaCase.DECODE, mla_v3_configs.MlaCase.MIXED),
+    )
+
+
+def _v3_schedules_for_step(md, mesh, in_specs, q_NTA, q_rope_TNH, kv_cache,
+                           sm_scale, q_scale, k_scale, v_scale):
+    """Builds v3's per-pass schedules once per step, shared by every layer."""
+    key = (id(md.seq_lens), id(md.block_tables), id(md.query_start_loc))
+    hit = _V3_SCHEDULE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    def _gen(q, q_rope, cache, kv_lens, page_indices, cu_q_lens, distribution):
+        cfgs = mla_v3_wrapper.mode_configs(
+            q,
+            q_rope,
+            cache,
+            kv_lens,
+            page_indices,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **_v3_kernel_kwargs(cache.shape[-1]),
+        )
+        return mla_v3_wrapper.build_schedules(cu_q_lens, kv_lens, page_indices,
+                                              distribution, cfgs)
+
+    # Same specs the kernel call uses for these operands, so the schedule is
+    # built over the identical shards.
+    gen_in_specs = (in_specs[0], in_specs[1], in_specs[4], in_specs[5],
+                    in_specs[6], in_specs[7], in_specs[8])
+    out = jax.jit(
+        jax.shard_map(_gen,
+                      mesh=mesh,
+                      in_specs=gen_in_specs,
+                      out_specs=P(ShardingAxisName.ATTN_DATA),
+                      check_vma=False))(q_NTA, q_rope_TNH, kv_cache,
+                                        md.seq_lens, md.block_tables,
+                                        md.query_start_loc,
+                                        md.request_distribution)
+    _V3_SCHEDULE_CACHE.clear()
+    _V3_SCHEDULE_CACHE[key] = out
+    return out
+
+
 def mla_attention(
         q_NTA: jax.Array,
         q_rope_TNH: jax.Array,
@@ -537,11 +673,41 @@ def mla_attention(
         or P(None, ShardingAxisName.MLP_TENSOR, None)  # attn output
     )
 
+    # v3 builds its schedule from cu_q_lens/kv_lens/page_indices/distribution,
+    # none of which vary by layer -- but every layer has its own shard_map, and
+    # XLA does not CSE the Pallas call, so building it inside the kernel costs
+    # one `mla_metadata_schedule` launch per layer (61 on R1). Build it once for
+    # the step here and hand the same pytree to every layer. The cache is keyed
+    # on the metadata object, which is rebuilt each step.
+    v3_schedules = None
+    if mla_version.use_v3():
+        v3_schedules = _v3_schedules_for_step(md, mesh, in_specs, q_NTA,
+                                              q_rope_TNH, kv_cache, sm_scale,
+                                              q_scale, k_scale, v_scale)
+        in_specs = in_specs + (P(ShardingAxisName.ATTN_DATA),)  # schedules
+
     def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, *args):
         # TODO: use auto tuner to find the best block sizes.
-        num_kv_pages_per_block = (3, 1, 1)
-        num_queries_per_block = (1, 16, 16)
-        decode_batch_size = 4
+        num_kv_pages_per_block = _MLA_KV_PAGES_PER_BLOCK
+        num_queries_per_block = _MLA_QUERIES_PER_BLOCK
+        decode_batch_size = _MLA_DECODE_BATCH_SIZE
+
+        if mla_version.use_v3():
+            *args, schedules = args
+            out, new_cache = mla_ragged_paged_attention_v3(
+                q,
+                q_rope,
+                k,
+                k_rope,
+                cache,
+                *args,
+                sm_scale=sm_scale,
+                schedules=schedules,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                **_v3_kernel_kwargs(cache.shape[-1]))
+            return new_cache, out
 
         out, new_cache = mla_ragged_paged_attention(
             q,
@@ -560,13 +726,14 @@ def mla_attention(
 
         return new_cache, out
 
+    operands = (q_NTA, q_rope_TNH, k_SA, k_rope_SH, kv_cache, md.seq_lens,
+                md.block_tables, md.query_start_loc, md.request_distribution)
+    if v3_schedules is not None:
+        operands = operands + (v3_schedules,)
     kv_cache, output_TNA = jax.jit(
         jax.shard_map(_mla_ragged_paged_attention,
                       mesh=mesh,
                       in_specs=in_specs,
                       out_specs=out_specs,
-                      check_vma=False))(q_NTA, q_rope_TNH, k_SA, k_rope_SH,
-                                        kv_cache, md.seq_lens, md.block_tables,
-                                        md.query_start_loc,
-                                        md.request_distribution)
+                      check_vma=False))(*operands)
     return kv_cache, output_TNA
