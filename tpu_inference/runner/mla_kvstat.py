@@ -4,11 +4,13 @@ Host-side only: reads the per-rank seq_lens the runner already built for the
 attention kernel, so the device program is unchanged. One line per step goes to
 the log, prefixed MLA_KVSTAT, as JSON:
 
-  {"s": step, "t": unix time, "pad": padded tokens per rank, "r": [rank, ...]}
+  {"s": step, "t": unix time, "pad": padded tokens per rank, "r": [rank, ...],
+   "kv": [[decode kv_len, ...] per rank]}
 
-with each rank a list in the order of FIELDS. Decodes are the first n_dec
-entries of each rank's seq_lens (the batch is reordered decode-first), which is
-also the order v2 groups them in.
+with each rank in "r" a list in the order of FIELDS, and "kv" the raw decode
+kv_lens so the block counts can be recomputed offline for any bkv or group.
+Decodes are the first n_dec entries of each rank's seq_lens (the batch is
+reordered decode-first), which is also the order v2 groups them in.
 
 Decode work is counted in the decode pass's KV blocks (DECODE_BKV tokens):
   v2_bd   sum over full groups of 4 of cdiv(max kv in group, bkv) -- MLA-bd
@@ -63,7 +65,8 @@ class KvStat:
         logger.info("MLA_KVSTAT_FIELDS %s",
                     json.dumps(dict(fields=FIELDS, bkv=DECODE_BKV, group=GROUP)))
 
-    def record(self, padded_tokens_per_rank: int, ranks: list[list[int]]):
+    def record(self, padded_tokens_per_rank: int, ranks: list[list[int]],
+               kv: list[list[int]]):
         self.step += 1
         t = self.tot
         t["steps"] += 1
@@ -78,7 +81,7 @@ class KvStat:
             t["v3"] += r[13]
         logger.info("MLA_KVSTAT %s", json.dumps(
             dict(s=self.step, t=round(time.time(), 3),
-                 pad=int(padded_tokens_per_rank), r=ranks),
+                 pad=int(padded_tokens_per_rank), r=ranks, kv=kv),
             separators=(",", ":")))
         if self.step % SUMMARY_EVERY == 0:
             logger.info("MLA_KVSTAT_SUM %s", json.dumps(dict(s=self.step, **t)))

@@ -1788,18 +1788,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if mla_kvstat.ENABLED:
             if not hasattr(self, "_mla_kvstat"):
                 self._mla_kvstat = mla_kvstat.KvStat()
-            _kv_ranks = []
+            _kv_ranks, _kv_raw = [], []
             for dp_rank in range(dp_size):
                 n_dec = _request_distribution[dp_rank][0]
                 off = dp_rank * max_num_reqs_per_dp_rank
                 sched = scheduled_tokens_per_dp_rank[dp_rank]
+                dec_kv = np.array(seq_lens_view[off:off + n_dec])
+                _kv_raw.append(dec_kv.tolist())
                 _kv_ranks.append(
                     mla_kvstat.rank_stats(
-                        np.array(seq_lens_view[off:off + n_dec]),
+                        dec_kv,
                         num_req_per_dp_rank[dp_rank] - n_dec,
                         int(sum(sched[n_dec:]))))
             self._mla_kvstat.record(padded_num_scheduled_tokens_per_dp_rank,
-                                    _kv_ranks)
+                                    _kv_ranks, _kv_raw)
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
