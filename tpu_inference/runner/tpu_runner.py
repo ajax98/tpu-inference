@@ -66,6 +66,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.jax.utils.weight_utils import (
     shard_put, transfer_state_with_mappings)
 from tpu_inference.runner import utils as runner_utils
+from tpu_inference.runner import mla_kvstat
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
@@ -1783,6 +1784,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
         request_distribution = np.array(_request_distribution,
                                         dtype=np.int32).ravel()
+
+        if mla_kvstat.ENABLED:
+            if not hasattr(self, "_mla_kvstat"):
+                self._mla_kvstat = mla_kvstat.KvStat()
+            _kv_ranks = []
+            for dp_rank in range(dp_size):
+                n_dec = _request_distribution[dp_rank][0]
+                off = dp_rank * max_num_reqs_per_dp_rank
+                sched = scheduled_tokens_per_dp_rank[dp_rank]
+                _kv_ranks.append(
+                    mla_kvstat.rank_stats(
+                        np.array(seq_lens_view[off:off + n_dec]),
+                        num_req_per_dp_rank[dp_rank] - n_dec,
+                        int(sum(sched[n_dec:]))))
+            self._mla_kvstat.record(padded_num_scheduled_tokens_per_dp_rank,
+                                    _kv_ranks)
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
