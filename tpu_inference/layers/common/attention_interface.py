@@ -23,6 +23,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import \
     splash_attention_kernel as splash
 from jax.experimental.pallas.ops.tpu.splash_attention import \
     splash_attention_mask as mask_lib
+from jax.experimental import layout as jax_layout
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
@@ -519,6 +520,13 @@ _MLA_DECODE_BATCH_SIZE = 4
 _MLA_V3_DECODE_KV_TOKENS = 2048
 _MLA_V3_DECODE_KV_PAGES = int(os.environ.get("MLA_V3_DECODE_KV_PAGES") or 0)
 _MLA_V3_DECODE_N_BUFFER = 2
+# v3x experiments (off for v3). KV_PIN stops the kernel's [dim, tokens] input
+# layout from propagating back into the fused q_a/kv_a projection, which at 4
+# tokens made that matmul write token-minor and run 2.2x slower. VMEM_LIMIT
+# replaces the whole-VMEM claim, which leaves MSA no room to prefetch across
+# the kernel.
+_MLA_V3X_KV_PIN = os.getenv("MLA_V3X_KV_PIN", "layout")  # none|barrier|layout
+_MLA_V3X_VMEM_LIMIT_MB = int(os.getenv("MLA_V3X_VMEM_LIMIT_MB", "0"))
 _MLA_V3_DECODE_BATCH = _MLA_DECODE_BATCH_SIZE
 # The smallest per-rank token bucket (4 tokens) holds 1-4 decodes, ~1 at
 # conc 8. G=4 runs each grid step with mostly empty lanes; G=2 halves that.
@@ -583,7 +591,19 @@ def _v3_kernel_kwargs(page_size: int, num_tokens: int | None = None) -> dict:
         # one kernel launch per layer; leaving it in costs both for a band that
         # cannot be non-empty.
         modes=(mla_v3_configs.MlaCase.DECODE, mla_v3_configs.MlaCase.MIXED),
+        **({"vmem_limit_bytes": _MLA_V3X_VMEM_LIMIT_MB << 20}
+           if mla_version.v3_xla_fixes() and _MLA_V3X_VMEM_LIMIT_MB > 0 else {}),
     )
+
+
+def _v3x_pin_kv(k, k_rope):
+    if not mla_version.v3_xla_fixes() or _MLA_V3X_KV_PIN == "none":
+        return k, k_rope
+    if _MLA_V3X_KV_PIN == "barrier":
+        return jax.lax.optimization_barrier((k, k_rope))
+    row_major = jax_layout.Layout(major_to_minor=(0, 1))
+    return (jax_layout.with_layout_constraint(k, row_major),
+            jax_layout.with_layout_constraint(k_rope, row_major))
 
 
 def _v3_schedules_for_step(md, mesh, in_specs, q_NTA, q_rope_TNH, kv_cache,
@@ -710,6 +730,7 @@ def mla_attention(
 
         if mla_version.use_v3():
             *args, schedules = args
+            k, k_rope = _v3x_pin_kv(k, k_rope)
             out, new_cache = mla_ragged_paged_attention_v3(
                 q,
                 q_rope,
