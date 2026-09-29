@@ -88,7 +88,15 @@ class DmaNew(ABC):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SeqAlongLaneDmaNew(DmaNew):
-  """Descriptor for new-token DMA in SEQ_ALONG_LANE layout (5 fields)."""
+  """Descriptor for new-token DMA in SEQ_ALONG_LANE layout (5 fields).
+
+  Fetch: the new tokens are contiguous in HBM and in VMEM, so entry 0 carries
+  one coalesced DMA for all of them and the other entries stay zero.
+  Writeback: one DMA per page, since `page_indices` scatters the destinations.
+  `wb_hbm` packs `(physical_page << page_size_log2) | offset_in_page`.
+  `_flags` packs the fetch and writeback token counts (multiples of 128) in
+  its low and high 16 bits.
+  """
   fetch_hbm = FieldOffset(0)
   fetch_vmem = FieldOffset(1)
   wb_hbm = FieldOffset(2)
@@ -104,18 +112,17 @@ class SeqAlongLaneDmaNew(DmaNew):
     val = self._flags
     if hasattr(val, "get"):
       val = val.get()
-    return val & 1
+    return val & 0xFFFF
 
   @property
   def wb_val(self):
     val = self._flags
     if hasattr(val, "get"):
       val = val.get()
-    return (val >> 1) & 1
+    return val >> 16
 
   def set_flags(self, fetch_val, wb_val):
-    self._flags[...] = fetch_val | (wb_val << 1)
-
+    self._flags[...] = fetch_val | (wb_val << 16)
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -191,13 +198,8 @@ class MlaSchedule:
   k_idx: SmemWrapper  # [steps, batch]
   is_last_k: SmemWrapper  # [steps, batch]
   do_writeback: SmemWrapper  # [steps, batch]
-  # How many unpaged new tokens land in this block. The kernel gates its
-  # new-KV merge on this every grid step and used to re-derive it from
-  # kv_lens/cu_q_lens indirections plus ~8 ops per lane; `k_loop` already has
-  # it while building descriptors.
-  new_sz: SmemWrapper  # [steps, batch]
   dma_q: SmemWrapper  # [steps, batch, 2]
-  dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
+  dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 2]
   dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
   total_wait_kv_in: SmemWrapper  # [steps]
   total_wait_kv_out: SmemWrapper  # [steps]
@@ -222,7 +224,6 @@ class MlaSchedule:
         k_idx=idx_wrapper,
         is_last_k=idx_wrapper,
         do_writeback=idx_wrapper,
-        new_sz=idx_wrapper,
         dma_q=SmemWrapper.create_shape_dtype(
             (effective_max_steps, cfgs.batch_size, 2)
         ),
@@ -242,22 +243,17 @@ class MlaSchedule:
         cfgs=cfgs,
     )
 
+  @property
+  def total_hbm_words(self) -> int:
+    leaves = jax.tree_util.tree_leaves(self)
+    return sum(int(leaf.shape[0]) for leaf in leaves if leaf.size > 1)
+
   def get_dma_kv_cache(
       self,
       step: jax.typing.ArrayLike,
       batch_idx: jax.typing.ArrayLike,
       page_idx: jax.typing.ArrayLike,
   ) -> tuple[jax.Array, jax.Array]:
-    """Source page index and validity flag for one cached-KV page.
-
-    Two things combined here. The VMEM destination is not stored: it is
-    `page_idx * page_size`, a compile-time constant that the caller's loop
-    index supplies, so it does not need a third field read back on every grid
-    step (batch_size * bkv_p_cache times, 12 at batch=4, bkv=3). And the reads
-    resolve the position once via `_get_pos` and index `data` directly, rather
-    than repeating the stride arithmetic per field -- that part is from the
-    upstream branch.
-    """
     pos = self.dma_kv_cache._get_pos((step, batch_idx, page_idx, 0))
     src_off = self.dma_kv_cache.data[pos]
     sz = self.dma_kv_cache.data[pos + 1]
@@ -277,6 +273,8 @@ class MlaSchedule:
   def in_specs(self):
     def wrapper(x):
       if x.size == 1:
+        if self.cfgs.mode == configs.MlaCase.DECODE:
+          return pl.BlockSpec(memory_space=pltpu.HBM)
         return pl.BlockSpec(memory_space=pltpu.SMEM)
       return pl.BlockSpec(memory_space=pltpu.HBM)
     return jax.tree.map(wrapper, self)
@@ -305,7 +303,6 @@ def _mask_out_steps(
   schedule_smem.k_idx[step, b_idx] = 0
   schedule_smem.is_last_k[step, b_idx] = 0
   schedule_smem.do_writeback[step, b_idx] = 0
-  schedule_smem.new_sz[step, b_idx] = 0
   schedule_smem.dma_q[step, b_idx, 0] = 0
   schedule_smem.dma_q[step, b_idx, 1] = 0
 
@@ -344,30 +341,80 @@ def _write_schedule_to_hbm(
   multiplier to cover `max_steps_needed` -- a static upper bound over every
   ragged split the shapes admit. Callers must not flush an empty buffer, which
   would advance past the last real step.
+
+  Only the steps the flush holds are copied. SMEM->HBM DMAs are slow, and always
+  writing the whole `max_steps_ub` buffer made a one-step decode schedule move
+  ~300 KiB. `num_steps` is traced, but a dynamic-size slice cannot be discharged
+  in interpret mode, so the copy is a traced number of fixed-size chunks rather
+  than one variable-size DMA. 128-step chunks keep every chunk offset a multiple
+  of the 128-word DMA tile whatever a leaf's words-per-step. Because
+  `max_steps_ub` is a multiple of 128, whole chunks stay inside both the SMEM
+  buffer and this flush's HBM slot. When `max_steps_needed` bounds every flush
+  to one chunk, the chunk shrinks to fit and the loop disappears.
   """
   hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)  # pytype: disable=bad-argument-type
   flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
   flat_smem = jax.tree_util.tree_leaves(schedule_smem)
-  dma_list = []
-  for h, s in zip(flat_hbm, flat_smem):
-    element_size = s.shape[0] // cfgs.max_steps_ub
-    if h.shape[0] > 1:
-      write_size = num_steps * element_size
-      write_size = utils.align_to(write_size, 128)
-      output_offset = hbm_offset_aligned * element_size
-    else:
-      write_size = h.shape[0]
-      output_offset = 0
 
-    copy = pltpu.make_async_copy(
-        s.at[pl.ds(0, write_size)],
-        h.at[pl.ds(output_offset, write_size)],
-        dma_sem.at[0],
-    )
-    dma_list.append(copy)
+  # At least one step: the final flush is traced even for a zero-token shape,
+  # where `max_steps_needed` is 0, although `count > 0` never lets it run.
+  max_flush_steps = max(1, min(cfgs.max_steps_ub, cfgs.max_steps_needed))
+  chunk_steps = min(128, max_flush_steps)
+  max_chunks = pl.cdiv(max_flush_steps, chunk_steps)
 
-  jax.tree.map(lambda x: x.start(), dma_list)
-  jax.tree.map(lambda x: x.wait(), dma_list)
+  def chunk_copies(chunk_idx):
+    copies = []
+    for h, s in zip(flat_hbm, flat_smem):
+      if h.shape[0] == 1:  # `actual_steps`, copied separately below.
+        continue
+      element_size = s.shape[0] // cfgs.max_steps_ub
+      chunk_size = utils.align_to(chunk_steps * element_size, 128)
+      src_offset = chunk_idx * chunk_size
+      if not isinstance(src_offset, int):
+        src_offset = pl.multiple_of(src_offset, 128)
+      dst_offset = pl.multiple_of(
+          hbm_offset_aligned * element_size + src_offset, 128
+      )
+      copies.append(
+          pltpu.make_async_copy(
+              s.at[pl.ds(src_offset, chunk_size)],
+              h.at[pl.ds(dst_offset, chunk_size)],
+              dma_sem.at[0],
+          )
+      )
+    return copies
+
+  scalar_copies = [
+      pltpu.make_async_copy(
+          s.at[pl.ds(0, 1)], h.at[pl.ds(0, 1)], dma_sem.at[0]
+      )
+      for h, s in zip(flat_hbm, flat_smem)
+      if h.shape[0] == 1
+  ]
+  for copy in scalar_copies:
+    copy.start()
+
+  if max_chunks == 1:
+    copies = chunk_copies(0)
+    for copy in copies:
+      copy.start()
+    for copy in copies:
+      copy.wait()
+  else:
+    num_chunks = pl.cdiv(jnp.asarray(num_steps), chunk_steps)
+
+    @pl.loop(0, num_chunks)
+    def _(chunk_idx):
+      for copy in chunk_copies(chunk_idx):
+        copy.start()
+
+    @pl.loop(0, num_chunks)
+    def _(chunk_idx):
+      for copy in chunk_copies(chunk_idx):
+        copy.wait()
+
+  for copy in scalar_copies:
+    copy.wait()
 
 
 def _compute_waits(
@@ -381,24 +428,15 @@ def _compute_waits(
 
   @jax.named_scope("compute_waits")
   def body(step, _):
-    # KV IN
+    # KV IN: every descriptor carries its token count (a lane-tile multiple).
     kv_in_tokens = 0
     for b in range(cfgs.batch_size):
-      # SEQ_ALONG_LANE transfers whole pages, so the descriptors carry a
-      # validity flag rather than a size and each valid one is `page_size`.
       for i in range(cfgs.bkv_p_cache):
-        _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
-        kv_in_tokens += dma_valid * cfgs.serve.page_size
+        _, sz = schedule.get_dma_kv_cache(step, b, i)
+        kv_in_tokens += sz
       for i in range(cfgs.bkv_p_new):
-        dma_entry = schedule.dma_kv_new[step, b, i]
-        kv_in_tokens += jnp.where(
-            dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
-        )
+        kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
 
-    # Stored as a *token* count, which is what `bref_override.wait_in` needs
-    # to size its wait region. It previously held a DMA-chunk count and was
-    # never read by anything, while the waiter recomputed the same sum from 16
-    # SMEM descriptors on every grid step.
     schedule.total_wait_kv_in[step] = kv_in_tokens
 
     # KV OUT
@@ -407,9 +445,7 @@ def _compute_waits(
       do_writeback = schedule.do_writeback[step, b] == 1
       for i in range(cfgs.bkv_p_new):
         dma_entry = schedule.dma_kv_new[step, b, i]
-        kv_out_tokens += jnp.where(
-            do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
-        )
+        kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
 
     schedule.total_wait_kv_out[step] = kv_out_tokens
 
@@ -418,9 +454,6 @@ def _compute_waits(
     for b in range(cfgs.batch_size):
       _, q_sz = schedule.get_dma_q(step, b)
       q_in_tokens += q_sz
-    # Token counts, as for the KV totals: that is what the waiters need, and
-    # keeping the `* const` form lets Mosaic see the alignment (see the note in
-    # `BatchingQRef.wait_in`).
     schedule.total_wait_q_in[step] = q_in_tokens
 
     # O OUT
@@ -445,18 +478,26 @@ def flush_to_hbm(
 ):
   last_step = utils.align_to(count, cfgs.batch_size)
 
-  @pl.loop(count, last_step)
+  if cfgs.mode == configs.MlaCase.DECODE:
+    static_steps = max(1, min(cfgs.max_steps_ub, cfgs.max_steps_needed))
+    mask_limit = static_steps * cfgs.batch_size
+    num_steps = static_steps
+  else:
+    mask_limit = last_step
+    num_steps = last_step // cfgs.batch_size
+
+  @pl.loop(count, mask_limit)
   @jax.named_scope("mask_out_steps")
   def body(idx):
     step, b_idx = divmod(idx, cfgs.batch_size)
     _mask_out_steps(step, schedule, b_idx)
 
-  _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
+  _compute_waits(schedule, 0, num_steps, cfgs=cfgs)
   _write_schedule_to_hbm(
       schedule,
       schedule_hbm_ref,
       hbm_offset,
-      cfgs.max_steps_ub,
+      num_steps,
       dma_sem,
       cfgs=cfgs,
   )
@@ -516,11 +557,12 @@ def compute_metadata(
       hbm_p_idx = page_indices_ref[src_hbm_idx]
 
       schedule.dma_kv_cache[step, target_lane, i, 0] = hbm_p_idx
-      # Whole-page transfer: the second field is a validity flag, not a size.
-      # The VMEM destination is `i * page_size` and is recomputed by the
-      # reader rather than stored; see `get_dma_kv_cache`.
-      schedule.dma_kv_cache[step, target_lane, i, 1] = jnp.where(
-          dma_sz > 0, 1, 0
+      # Token count rounded up to the lane tile: only the tiles holding cached
+      # tokens are fetched, not the whole page. Both ends are static: the
+      # source starts at offset 0 of the page, the destination at
+      # i * page_size.
+      schedule.dma_kv_cache[step, target_lane, i, 1] = utils.align_to(
+          dma_sz, cfgs.kv_token_align
       )
 
     kv_left_frm_new = kv_left - kv_left_frm_cache
@@ -530,46 +572,49 @@ def compute_metadata(
     q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
     do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
     schedule.do_writeback[step, target_lane] = do_writeback
-    schedule.new_sz[step, target_lane] = new_sz
 
-    def fill_dma_kv_new(i, dma_sz, slot_start):
+    def fill_dma_kv_new(i, dst_vmem, dma_sz):
+      """Fills new-KV entry `i`: writes back `dma_sz` tokens at `dst_vmem`."""
       dma_entry = schedule.dma_kv_new[step, target_lane, i]
-      cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
-      hbm_token_idx_base = q_end - kv_left_frm_new
+      align = cfgs.kv_token_align
+      # Fetch: the new tokens are contiguous in HBM and in VMEM, so one DMA
+      # moves all of them. Entry 0 carries it, widened to the lane tile on both
+      # ends, and lands right after the cached tiles; the stitch later shifts
+      # the tokens down to `bkv_sz_cache`. The other entries stay zero.
+      if i == 0:
+        src_hbm = q_end - kv_left_frm_new
+        src, _, fetch_val = utils.align_span(src_hbm, new_sz, align)
+        dma_entry.fetch_hbm[...] = src
+        dma_entry.fetch_vmem[...] = utils.align_to(bkv_sz_cache, align)
+        fetch_val = jnp.where(new_sz > 0, fetch_val, 0)
+      else:
+        dma_entry.fetch_hbm[...] = 0
+        dma_entry.fetch_vmem[...] = 0
+        fetch_val = 0
 
-
-      new_tok_offset = hbm_token_idx_base % cfgs.serve.page_size
-      num_pages_to_fetch = jnp.where(
-          new_sz > 0,
-          (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
-          0,
-      )
-      fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-      new_page_start = (
-          hbm_token_idx_base - new_tok_offset
-      ) + i * cfgs.serve.page_size
-      fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
+      # Writeback: one DMA per page, since page_indices scatters the pages,
+      # widened to the lane tiles that hold the tokens. The tiles' leading
+      # lanes are cached tokens that VMEM holds unchanged, and the trailing
+      # ones lie past the sequence end, so rewriting them is harmless.
+      tok_idx = kv_len_start + dst_vmem
       p_idx = jnp.minimum(
-          (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
-          cfgs.serve.pages_per_seq - 1,
+          tok_idx >> cfgs.serve.page_size_log2, cfgs.serve.pages_per_seq - 1
       )
       dst_hbm_idx = jnp.minimum(
           s_idx * cfgs.serve.pages_per_seq + p_idx,
           cfgs.serve.num_page_indices - 1,
       )
       hbm_p_idx = page_indices_ref[dst_hbm_idx]
-      wb_val = jnp.where(dma_sz > 0, 1, 0)
+      p_off = tok_idx & cfgs.serve.page_size_mask
+      dst, lead, wb_val = utils.align_span(p_off, dma_sz, align)
 
-      dma_entry.fetch_hbm[...] = new_page_start
-      dma_entry.fetch_vmem[...] = fetch_vmem
-      dma_entry.wb_hbm[...] = hbm_p_idx
-      dma_entry.wb_vmem[...] = slot_start
-      dma_entry.set_flags(fetch_val, wb_val)
+      dma_entry.wb_hbm[...] = (hbm_p_idx << cfgs.serve.page_size_log2) | dst
+      dma_entry.wb_vmem[...] = dst_vmem - lead
+      dma_entry.set_flags(fetch_val, jnp.where(dma_sz > 0, wb_val, 0))
 
     if cfgs.one_new_token:
       assert cfgs.bkv_p_new == 1
-      slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
-      fill_dma_kv_new(0, new_sz, slot_start)
+      fill_dma_kv_new(0, bkv_sz_cache, new_sz)
     else:
       iters = max(cfgs.bkv_p, cfgs.bkv_p_new)
       for i in range(iters):
@@ -580,7 +625,7 @@ def compute_metadata(
         end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
         dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
 
-        fill_dma_kv_new(i, dma_sz, slot_start)
+        fill_dma_kv_new(i, dst_vmem, dma_sz)
 
     def flush(carry: LoopCarry):
       hbm_offset = carry.hbm_offset
@@ -699,20 +744,26 @@ def rpa_metadata_schedule_kernel(
         cfgs=cfgs,
     )
 
-  # `actual_steps` reaches HBM only as part of a flush, so skipping the flush
-  # leaves it holding whatever the output buffer held before. The MLA kernel
-  # reads it as a grid trip count -- `cdiv(actual_steps, max_steps_ub)` -- so
-  # stale contents send the step loop past the end of the schedule. Copy it
-  # explicitly in the empty case.
   @pl.when(count == 0)
   def _():
-    copy_actual_steps = pltpu.make_async_copy(
-        schedule_ref.actual_steps.at[pl.ds(0, 1)],
-        schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
-        dma_sem.at[0],
-    )
-    copy_actual_steps.start()
-    copy_actual_steps.wait()
+    if cfgs.mode == configs.MlaCase.DECODE:
+      flush_to_hbm(
+          0,
+          schedule_ref,
+          schedule_hbm_ref,
+          hbm_offset,
+          dma_sem,
+          cfgs=cfgs,
+      )
+    else:
+      copy = pltpu.make_async_copy(
+          schedule_ref.actual_steps.at[pl.ds(0, 1)],
+          schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
+          dma_sem.at[0],
+      )
+      copy.start()
+      copy.wait()
+
 
 
 def generate_mla_metadata(
@@ -729,10 +780,16 @@ def generate_mla_metadata(
   schedule_hbm = MlaSchedule.create_shape_dtype(
       cfgs, multiplier=cfgs.max_schedule_size_multiplier
   )
+  # `out_specs` only types the refs inside the kernel; where XLA places the
+  # output buffers comes from the `out_shape` avals. Plain ShapeDtypeStructs
+  # carry no memory space, so XLA was free to put the schedule in VMEM and then
+  # evict it to HBM with copy-start/done pairs before the attention kernel ran.
+  # Tagging each leaf as HBM pins the outputs there.
+  out_shape = jax.tree.map(lambda x: pltpu.HBM(x.shape, x.dtype), schedule_hbm)
 
   return pl.pallas_call(
       functools.partial(rpa_metadata_schedule_kernel, cfgs=cfgs),
-      out_shape=schedule_hbm,
+      out_shape=out_shape,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=4,
           in_specs=[],

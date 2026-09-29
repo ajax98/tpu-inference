@@ -54,6 +54,16 @@ def align_to(a: Any, b: int) -> Any:
   return pl.cdiv(a, b) * b
 
 
+def align_span(start: Any, size: Any, align: int) -> tuple[Any, Any, Any]:
+  """Returns (aligned_start, lead, aligned_size) for [start, start + size).
+
+  Grows the span outward to multiples of `align` on both ends; `lead` is how
+  far `aligned_start` moved down from `start`.
+  """
+  lead = start % align
+  return start - lead, lead, align_to(lead + size, align)
+
+
 def broadcast_minor(src: jax.Array, shape: Sequence[int]) -> jax.Array:
   """Broadcasts 'src' to 'shape' in the minor dimension."""
   if src.shape == shape:

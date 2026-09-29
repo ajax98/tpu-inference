@@ -84,15 +84,10 @@ class KVLayout(enum.StrEnum):
   """Memory layout of the paged KV cache in HBM and VMEM.
 
   - SEQ_ALONG_LANE: Sequence tokens are packed along the 128 TPU physical lanes;
-      latent dimension is on sublanes. Cache is [pages, kv_dim, page_size].
+      latent dimension is on sublanes.
 
-  A HEAD_ALONG_LANE variant (v2's orientation: tokens on sublanes,
-  [pages, page_size/packing, packing, kv_dim]) was implemented and measured. It
-  removes the new-token merge entirely -- tokens can be DMA'd to their logical
-  offset because the token axis is untiled -- but it was 8.9% slower at 8
-  sequences and 21.4% slower at 32, against a within-config sd of ~1.5 us. The
-  merge was never the cost; the SEQ orientation is simply the better operand
-  layout for the attention matmuls. Removed rather than kept as dead config.
+  This is the only layout v3 implements, and the enum exists to name it rather
+  than to offer a choice.
   """
 
   SEQ_ALONG_LANE = enum.auto()
@@ -132,9 +127,9 @@ class ServingConfigs:
   page_size: int
   total_q_tokens: int
   num_page_indices: int
-  dtype_q: jnp.dtype
-  dtype_kv: jnp.dtype
-  dtype_out: jnp.dtype
+  dtype_q: Any
+  dtype_kv: Any
+  dtype_out: Any
   scale_q: float | None = None
   scale_k: float | None = None
   scale_v: float | None = None
@@ -222,6 +217,10 @@ class ServingConfigs:
   @property
   def page_size_log2(self) -> int:
     return (self.page_size - 1).bit_length()
+
+  @property
+  def page_size_mask(self) -> int:
+    return self.page_size - 1
 
   @property
   def packing_q(self) -> int:
@@ -516,50 +515,50 @@ class MlaConfigs:
     )
 
   @property
+  def kv_token_align(self) -> int:
+    """DMA token granularity: the 128-lane tile.
+
+    Tokens are packed along the lane dim (SEQ_ALONG_LANE), so every KV DMA
+    token count and lane offset must be a multiple of the lane tile. It used
+    to be `page_size`, which was pinned to 128; pages may now be any
+    power-of-two multiple of 128, and rounding every fetch up to a page
+    wastes bandwidth and VMEM.
+    """
+    return utils.get_tpu_num_lanes()
+
+  @property
   def kv_vmem_lanes(self) -> int:
     """Lane extent of the KV staging buffer: `bkv_sz` plus stitch slack.
 
-    The slack holds new-KV pages fetched *past* the cached region before
-    `stitch_*_lane` rolls them into place. `fill_dma_kv_new` writes
-    `page_size` bytes at `fetch_vmem = (cache_pages + i) * page_size`, so the
-    buffer must cover `(cache_pages + i + 1) * page_size`. Two pages in
-    general: one for rounding `bkv_sz_cache` up to a page, one for the new
-    tokens' own intra-page offset.
+    Cache pages land at `i * page_size` with their token count rounded up to
+    `kv_token_align`, so the cached region ends at
+    `align_to(bkv_sz_cache, kv_token_align)`. The new tokens are fetched in one
+    DMA starting there, widened to `kv_token_align` on both ends. Each [] is a
+    128-lane tile (o = cache, n = new, - = pad):
 
-    **Decode needs only one.** With `q_len == 1`,
-    `new_sz = min(bkv_sz - bkv_sz_cache, kv_left_frm_new) <= 1` token, so
-    `num_pages_to_fetch == 1` and only `i = 0` runs -- which the `bq_sz == 1`
-    branch in `schedule.fill_dma_kv_new` already asserts via
-    `bkv_p_new == 1`. Then `fetch_vmem = cache_pages * page_size <= bkv_sz`
-    and the write extends one page: `bkv_sz + page_size` suffices, and the
-    second page is never touched.
+      want  [onnn][nnnn]
+      got   [o---][---n][nnnn][nn--]
 
-    Reserving it anyway costs 20% of the buffer at page_size=1024 and widens
-    the DMA destination stride (5120 vs 4096 lanes for a 1024-byte write),
-    which is why this is worth a flag rather than left as a constant.
+    so the buffer needs two tiles past `bkv_sz`: one for rounding
+    `bkv_sz_cache` up, one for the new tokens' offset within their tile.
 
-    The guard mirrors the condition `stitch_new_kv_lane` uses to select its
-    O(1) path, so it cannot apply to a multi-token query block.
+    See `ServingConfigs.kv_slack_pad_lanes` for why the total width's parity in
+    tiles matters for VMEM bank conflicts.
     """
-    # The second page is dead weight on decode, exactly as described above,
-    # and it is not free: at bkv=3/page=1024/batch=8 it is 10.5 MB of a 64 MB
-    # VMEM, which is what put `batch=8` 1.55 MB over the limit and forced
-    # batch=4 -- doubling the grid-step count that v3's remaining decode
-    # deficit is proportional to.
-    slack_pages = 1 if self.one_new_token else 2
     return (
         self.block.bkv_sz
-        + slack_pages * self.serve.page_size
+        + 2 * self.kv_token_align
         + self.serve.kv_slack_pad_lanes
     )
 
   @property
   def kv_vmem_shape(self) -> tuple[int, ...]:
-    """VMEM allocation shape for the KV staging buffer.
-
-    [batch, aligned_kv_dim, tokens] -- tokens minormost, i.e. on lanes.
-    """
-    return (self.block.batch_size, self.aligned_kv_dim, self.kv_vmem_lanes)
+    """VMEM allocation shape for KV buffer [batch_size, aligned_kv_dim, lanes]."""
+    return (
+        self.block.batch_size,
+        self.aligned_kv_dim,
+        self.kv_vmem_lanes,
+    )
 
   @property
   def q_vmem_shape(self) -> tuple[int, ...]:

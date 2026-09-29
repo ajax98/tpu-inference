@@ -512,18 +512,31 @@ _MLA_DECODE_BATCH_SIZE = 4
 # without a rebuild.
 # `or` rather than a get() default: the recipe passes an empty string when
 # unset, and int("") raises.
-_MLA_V3_DECODE_KV_PAGES = int(
-    os.environ.get("MLA_V3_DECODE_KV_PAGES") or _MLA_KV_PAGES_PER_BLOCK[0]
-)
+#
+# Default is now 2048 tokens rather than v2's 3 pages: at low concurrency each
+# rank decodes ~1 sequence, and the smaller block halves the DMA/compute of the
+# last, mostly-empty block. MLA_V3_DECODE_KV_PAGES still overrides.
+_MLA_V3_DECODE_KV_TOKENS = 2048
+_MLA_V3_DECODE_KV_PAGES = int(os.environ.get("MLA_V3_DECODE_KV_PAGES") or 0)
 _MLA_V3_DECODE_N_BUFFER = 2
 _MLA_V3_DECODE_BATCH = _MLA_DECODE_BATCH_SIZE
+# The smallest per-rank token bucket (4 tokens) holds 1-4 decodes, ~1 at
+# conc 8. G=4 runs each grid step with mostly empty lanes; G=2 halves that.
+_MLA_V3_SMALL_BUCKET_TOKENS = 4
+_MLA_V3_SMALL_BUCKET_BATCH = int(
+    os.environ.get("MLA_V3_SMALL_BUCKET_BATCH") or 2)
+
+
+def _v3_decode_kv_pages(page_size: int) -> int:
+    return _MLA_V3_DECODE_KV_PAGES or max(
+        1, _MLA_V3_DECODE_KV_TOKENS // page_size)
 
 # Keyed on the identity of the metadata arrays, which are rebuilt every step.
 # Only ever holds the current step.
 _V3_SCHEDULE_CACHE: dict = {}
 
 
-def _v3_kernel_kwargs(page_size: int) -> dict:
+def _v3_kernel_kwargs(page_size: int, num_tokens: int | None = None) -> dict:
     """Block sizes for v3, mirroring v2's per-mode tuples.
 
     v2 takes (decode, prefill, mixed) tuples; v3 takes a BlockSizes per pass, so
@@ -543,8 +556,11 @@ def _v3_kernel_kwargs(page_size: int) -> dict:
             #
             # Single-shot medians compared across jobs cannot resolve anything
             # below ~4% here. There is no decode tiling win above that floor.
-            bkv_sz=_MLA_V3_DECODE_KV_PAGES * page_size,
-            batch_size=_MLA_V3_DECODE_BATCH,
+            bkv_sz=_v3_decode_kv_pages(page_size) * page_size,
+            batch_size=(_MLA_V3_SMALL_BUCKET_BATCH
+                        if num_tokens is not None
+                        and num_tokens <= _MLA_V3_SMALL_BUCKET_TOKENS else
+                        _MLA_V3_DECODE_BATCH),
             n_buffer=_MLA_V3_DECODE_N_BUFFER,
         ),
         prefill_block_sizes=mla_v3_configs.BlockSizes(
@@ -589,7 +605,7 @@ def _v3_schedules_for_step(md, mesh, in_specs, q_NTA, q_rope_TNH, kv_cache,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            **_v3_kernel_kwargs(cache.shape[-1]),
+            **_v3_kernel_kwargs(cache.shape[-1], q.shape[1]),
         )
         return mla_v3_wrapper.build_schedules(cu_q_lens, kv_lens, page_indices,
                                               distribution, cfgs)
@@ -706,7 +722,7 @@ def mla_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                **_v3_kernel_kwargs(cache.shape[-1]))
+                **_v3_kernel_kwargs(cache.shape[-1], q.shape[1]))
             return new_cache, out
 
         out, new_cache = mla_ragged_paged_attention(

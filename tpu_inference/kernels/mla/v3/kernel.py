@@ -283,7 +283,12 @@ def prepare_kv_inputs_for_transposed_kv_cache(
   """
   max_num_tokens, actual_head_dim = kv.shape
 
-  pad_multiple = max(128, page_size)
+  # 128, not the page size. The kernel fetches new KV as one 128-lane-aligned
+  # span ending at most at align_to(num_tokens, 128), so nothing reads past
+  # that. Padding a 4-token decode bucket to a 1024-token page was a
+  # [640, 1024] pad+transpose per layer for 4 real tokens.
+  del page_size
+  pad_multiple = 128
   if max_num_tokens % pad_multiple != 0:
     pad = pad_multiple - (max_num_tokens % pad_multiple)
     kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
@@ -330,13 +335,13 @@ def create_allocs(
       block_shape=cfgs.kv_vmem_shape,
       memory_space=pltpu.VMEM,
       index_map=lambda i: (i,),
-      pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
+      pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=False),
   )
   q_spec = pl.BlockSpec(
       block_shape=cfgs.q_vmem_shape,
       memory_space=pltpu.VMEM,
       index_map=lambda i: (i,),
-      pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
+      pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=False),
   )
   o_spec = pl.BlockSpec(
       block_shape=cfgs.o_vmem_shape,
@@ -349,14 +354,14 @@ def create_allocs(
       spec=kv_cache_spec,
       dtype_or_type=cache_kv_hbm_ref,
       buffer_count=cfgs.n_buffer,
-      use_lookahead=True,
+      use_lookahead=False,
       cfgs=cfgs,
   )
   q_alloc = bref_override.BatchingQRef.input(
       spec=q_spec,
       dtype_or_type=ql_nope_hbm_ref,
       buffer_count=cfgs.n_buffer,
-      use_lookahead=True,
+      use_lookahead=False,
       cfgs=cfgs,
   )
   o_alloc = bref_override.BatchingORef.output(
@@ -453,42 +458,40 @@ def mla_body(
       processed_q_len.append((q_idx * cfgs.bq_sz + offset))
       processed_kv_len.append(k_id)
 
-      # `schedule.k_loop` already derived this while building the descriptors;
-      # re-deriving it here cost the indirections above plus ~8 ops per lane on
-      # every grid step, and the deficit against v2 is per-grid-step.
-      new_sz_list.append(schedule_ref.new_sz[step, b_idx])
+      # Stitching metadata
+      kv_left = jnp.maximum(kv_len - k_id, 0)
+      kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+      kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
-      # The remaining merge metadata is only read inside the gate below, which
-      # fires on one lane-step in three, so it is computed there rather than
-      # here. Deferred as thunks to keep the per-lane values bound.
-      def _merge_meta(kv_len=kv_len, k_id=k_id, q_len=q_len, q_end=q_end):
-        kv_left = jnp.maximum(kv_len - k_id, 0)
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-        kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
-        return (jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz),
-                q_end - kv_left_frm_new)
+      bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
+      new_kv_len_start = q_end - kv_left_frm_new
 
-      bkv_sz_frm_cache_list.append(_merge_meta)
-      new_kv_len_start_list.append(None)
+      bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
+      new_kv_len_start_list.append(new_kv_len_start)
+      # Mirrors `schedule.k_loop`'s `new_sz`: how many unpaged new tokens land in
+      # this block. Zero for every step except the one holding the sequence's
+      # new token, which is what `gate_stitch` keys on.
+      new_sz_list.append(
+          jnp.minimum(cfgs.bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
+      )
 
-  # Skip the merge -- strided loads, roll, strided stores -- on lanes with no
-  # new tokens. Only one step per sequence has any, so ~2/3 of lane-steps
-  # elide. Each lane owns a disjoint slot, so there is no cross-lane hazard in
-  # skipping the store. -2.7% on decode.
+  # Skip the whole merge -- strided loads, roll, strided stores -- on lanes
+  # with no new tokens. Only one step per sequence has any, so ~2/3 of
+  # lane-steps elide. Each lane owns a disjoint slot, so there is no
+  # cross-lane hazard in skipping the store. -2.7% on decode.
   for b_idx in range(cfgs.batch_size):
 
     @pl.when(new_sz_list[b_idx] > 0)
     def _stitch_and_store(b_idx=b_idx):
       with jax.named_scope("stitch_and_store"):
-        bkv_sz_frm_cache, new_kv_len_start = bkv_sz_frm_cache_list[b_idx]()
         stitch_utils.store_new_kv_lane(
             kv_in_vref,
             b_idx,
             stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
-                bkv_sz_frm_cache,
-                new_kv_len_start,
+                bkv_sz_frm_cache_list[b_idx],
+                new_kv_len_start_list[b_idx],
                 cfgs=cfgs,
             ),
             cfgs=cfgs,
@@ -555,12 +558,17 @@ def _mla_ragged_paged_attention_kernel(
 ) -> tuple[jax.Array, jax.Array]:
   """Executes the Pallas MLA attention pipeline with HBM schedule data."""
 
+  aligned_cu_q_len = utils.align_to(cu_q_lens.shape[0], 128)
+  aligned_kv_len = utils.align_to(kv_lens.shape[0], 128)
+  cu_q_lens_padded = jnp.pad(
+      cu_q_lens, (0, aligned_cu_q_len - cu_q_lens.shape[0])
+  )
+  kv_lens_padded = jnp.pad(kv_lens, (0, aligned_kv_len - kv_lens.shape[0]))
+
   def ragged_paged_attention_pipeline(
-      # Scalar prefetch.
-      cu_q_lens_ref: jax.Ref,
-      kv_lens_ref: jax.Ref,
-      page_indices_ref: jax.Ref,
       # Inputs.
+      cu_q_lens_hbm_ref: jax.Ref,
+      kv_lens_hbm_ref: jax.Ref,
       schedule_hbm_ref: schedule.MlaSchedule,
       ql_nope_hbm_ref: jax.Ref,
       q_pe_hbm_ref: jax.Ref,
@@ -577,15 +585,35 @@ def _mla_ragged_paged_attention_kernel(
         cache_kv_hbm_ref, ql_nope_hbm_ref, q_pe_hbm_ref, o_hbm_ref, cfgs
     )
 
-    actual_steps = schedule_hbm_ref.actual_steps[0]
-    num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
+    is_decode = cfgs.mode == configs.MlaCase.DECODE
+    if is_decode:
+      static_steps = max(1, min(cfgs.max_steps_ub, cfgs.max_steps_needed))
+      num_safe_step_iterations = 1
+    else:
+      actual_steps = schedule_hbm_ref.actual_steps[0]
+      num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
+
+    sched_template = schedule.MlaSchedule.create_shape_dtype(cfgs)
 
     @pl.with_scoped(
         final_allocs=(q_alloc, kv_cache_alloc, o_alloc),
-        schedule_ref=schedule.MlaSchedule.create_shape_dtype(
-            cfgs
-        ).scratch_shapes(),
+        schedule_ref=sched_template.scratch_shapes(),
+        schedule_wait_ref=pltpu.SMEM(
+            (
+                sched_template.total_hbm_words
+                + aligned_cu_q_len
+                + aligned_kv_len,
+            ),
+            jnp.int32,
+        ),
+        cu_q_lens_smem_ref=pltpu.SMEM((aligned_cu_q_len,), jnp.int32),
+        kv_lens_smem_ref=pltpu.SMEM((aligned_kv_len,), jnp.int32),
         dma_sem=pltpu.SemaphoreType.DMA((1,)),
+        # One flag per (KV buffer slot, lane): set once that slot's window for
+        # that lane holds only finite values. See KVBufferedRefSeqAlongLane.
+        kv_finite_ref=pltpu.SMEM(
+            (cfgs.n_buffer * cfgs.batch_size,), jnp.int32
+        ),
         scratches=(
             pltpu.VMEM(
                 cfgs.lm_scratch_shape,
@@ -601,30 +629,49 @@ def _mla_ragged_paged_attention_kernel(
             ),  # acc
         ),
     )
-    def _run(final_allocs, schedule_ref, dma_sem, scratches):
-      scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-      scratches[1][...] = jnp.zeros_like(scratches[1])
-      scratches[2][...] = jnp.zeros_like(scratches[2])
-
-      kv_alloc = final_allocs[1]
-      assert kv_alloc.window_ref is not None
-
+    def _run(
+        final_allocs,
+        schedule_ref,
+        schedule_wait_ref,
+        cu_q_lens_smem_ref,
+        kv_lens_smem_ref,
+        dma_sem,
+        kv_finite_ref,
+        scratches,
+    ):
       def execute_schedule_chunk(start_step, num_steps):
         aligned_start_step = (start_step // 128) * 128
         prefix_steps = start_step - aligned_start_step
 
+        @pl.when(start_step == 0)
+        def _():
+          copy_q = pltpu.make_async_copy(
+              cu_q_lens_hbm_ref,
+              cu_q_lens_smem_ref,
+              dma_sem.at[0],
+          )
+          copy_kv = pltpu.make_async_copy(
+              kv_lens_hbm_ref,
+              kv_lens_smem_ref,
+              dma_sem.at[0],
+          )
+          copy_q.start()
+          copy_kv.start()
+
         flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
         flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-        dma_list = []
+        total_words = 0
         for h, s in zip(flat_hbm, flat_smem):
-          if jax.typeof(h).memory_space == pltpu.HBM:
+          if jax.typeof(h).memory_space == pltpu.HBM and s.shape[0] > 1:
             element_size = s.shape[0] // cfgs.max_steps_ub
-            read_size = element_size * (num_steps + prefix_steps)
-            read_size = utils.align_to(read_size, 1024)
-            read_size = jnp.minimum(read_size, s.shape[0])
-
-            src_off = element_size * aligned_start_step
-            src_off = pl.multiple_of(src_off, 128)
+            if is_decode:
+              read_size = utils.align_to(element_size * static_steps, 128)
+              src_off = 0
+            else:
+              read_size = element_size * (num_steps + prefix_steps)
+              read_size = utils.align_to(read_size, 128)
+              read_size = jnp.minimum(read_size, s.shape[0])
+              src_off = pl.multiple_of(element_size * aligned_start_step, 128)
 
             copy = pltpu.make_async_copy(
                 h.at[pl.ds(src_off, read_size)],
@@ -632,20 +679,33 @@ def _mla_ragged_paged_attention_kernel(
                 dma_sem.at[0],
             )
             copy.start()
-            dma_list.append(copy)
+            total_words += read_size
 
+        total_words = pl.multiple_of(jnp.asarray(total_words), 128)
+        extra_lens_words = jnp.where(
+            start_step == 0, aligned_cu_q_len + aligned_kv_len, 0
+        )
+
+        # Zero scratches here:
         @pl.when(start_step == 0)
-        def _zero_kv():
-          kv_alloc.window_ref[...] = jnp.zeros_like(kv_alloc.window_ref)
+        def _zero_scratches():
+          scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+          scratches[1][...] = jnp.zeros_like(scratches[1])
+          scratches[2][...] = jnp.zeros_like(scratches[2])
+          for i in range(cfgs.n_buffer * cfgs.batch_size):
+            kv_finite_ref[i] = 0
 
-        jax.tree.map(lambda x: x.wait(), dma_list)
+        total_wait_words = total_words + extra_lens_words
+        total_wait_words = pl.multiple_of(jnp.asarray(total_wait_words), 128)
+        dummy_slice = schedule_wait_ref.at[pl.ds(0, total_wait_words)]
+        pltpu.make_async_copy(dummy_slice, dummy_slice, dma_sem.at[0]).wait()
 
         pipeline_func = pltpu.emit_pipeline(
             body=functools.partial(
                 mla_body,
                 cfgs=cfgs,
-                cu_q_lens_ref=cu_q_lens_ref,
-                kv_lens_ref=kv_lens_ref,
+                cu_q_lens_ref=cu_q_lens_smem_ref,
+                kv_lens_ref=kv_lens_smem_ref,
             ),
             grid=(num_steps + prefix_steps,),
             in_specs=(
@@ -661,7 +721,7 @@ def _mla_ragged_paged_attention_kernel(
                 new_kv_c_hbm_ref,
                 new_k_pe_hbm_ref,
                 schedule_ref,
-                page_indices_ref,
+                kv_finite_ref,
             ),
             (o_hbm_ref, schedule_ref),
             scratches=(schedule_ref,) + scratches,
@@ -670,17 +730,27 @@ def _mla_ragged_paged_attention_kernel(
 
       @pl.loop(0, num_safe_step_iterations)
       def loop_body(step_idx):
-        start = step_idx * cfgs.max_steps_ub
-        rem = actual_steps % cfgs.max_steps_ub
-        last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
-        is_last_step = step_idx == num_safe_step_iterations - 1
-        size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+        if is_decode:
+          execute_schedule_chunk(0, static_steps)
+        else:
+          start = step_idx * cfgs.max_steps_ub
+          rem = actual_steps % cfgs.max_steps_ub
+          last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+          is_last_step = step_idx == num_safe_step_iterations - 1
+          size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
-        execute_schedule_chunk(start, size)
+          execute_schedule_chunk(start, size)
 
     _run()
 
-  num_pre_leaves = 3  # cu_q_lens, kv_lens, page_indices
+  if cfgs.mode == MlaCase.DECODE:
+    # Decode runs a static `max_steps_needed` and never reads `actual_steps`.
+    # XLA passes an s32[1] custom-call operand by value, so keeping it costs a
+    # blocking HBM round trip (DMA to VMEM, wait, vpush/spop) right before the
+    # kernel starts, whatever its BlockSpec memory space. Drop it.
+    schedule_hbm = dataclasses.replace(schedule_hbm, actual_steps=None)  # pytype: disable=bad-argument-type
+
+  num_pre_leaves = 2  # cu_q_lens, kv_lens, page_indices
   num_sched_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
   ql_nope_hbm_idx = num_pre_leaves + num_sched_leaves
   cache_kv_hbm_idx = ql_nope_hbm_idx + 4
@@ -689,8 +759,10 @@ def _mla_ragged_paged_attention_kernel(
       ragged_paged_attention_pipeline,
       out_shape=[ql_nope_hbm, cache_kv_hbm],
       grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=3,
+          num_scalar_prefetch=0,
           in_specs=[
+              pl.BlockSpec(memory_space=pltpu.HBM),  # cu_q_lens_padded
+              pl.BlockSpec(memory_space=pltpu.HBM),  # kv_lens_padded
               schedule_hbm.in_specs(),
               pl.BlockSpec(memory_space=pltpu.HBM),  # ql_nope_hbm_ref
               pl.BlockSpec(memory_space=pltpu.HBM),  # q_pe_hbm_ref
@@ -709,11 +781,10 @@ def _mla_ragged_paged_attention_kernel(
       ),
       input_output_aliases={ql_nope_hbm_idx: 0, cache_kv_hbm_idx: 1},
       name=get_kernel_name(cfgs),
-      metadata=get_kernel_metadata(cfgs),
+      metadata={k: str(v) for k, v in get_kernel_metadata(cfgs).items()},
   )(
-      cu_q_lens,
-      kv_lens,
-      page_indices,
+      cu_q_lens_padded,
+      kv_lens_padded,
       schedule_hbm,
       ql_nope_hbm,
       q_pe_hbm,

@@ -12,20 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stitch utilities for Batched MLA v3.
+"""Stitch utilities for Batched MLA v3 (Transposed KV Cache).
 
-Merges newly-fetched KV tokens into their logical position inside the VMEM
-block. The new tokens arrive page-aligned from HBM but belong at
-`bkv_sz_cache`, so something has to move them.
-
-Two implementations, because the token axis moves:
-
-  SEQ_ALONG_LANE  -- a token is a *lane*. The block is bitcast to u32 and the
-      boundary vreg is rolled and selected lane-wise. O(1) for decode.
-
-      one 32-bit word, so a single token is not addressable in the u32 view at
-      all. Instead the stitch works in the native dtype, where one token is a
-      contiguous row of `aligned_kv_dim`, and the merge is a row copy.
+Handles rolling and merging unpaged new KV tokens into contiguous VMEM blocks
+for SEQ_ALONG_LANE memory layout.
 """
 
 from typing import Any
@@ -40,7 +30,7 @@ from tpu_inference.kernels.mla.v3 import utils
 def _stitch_decode_lane(
     vmem_u32_ref: jax.Array,
     bkv_sz_cache: jax.Array,
-    cache_pages: jax.Array,
+    cache_end: jax.Array,
     new_tok_offset: jax.Array,
     v_len: int,
     *,
@@ -55,7 +45,7 @@ def _stitch_decode_lane(
   dst_rel = bkv_sz_cache % num_lanes
 
   # Source: VREG chunk index and lane offset of fetched token in VMEM.
-  src_tok_idx = cache_pages * cfgs.serve.page_size + new_tok_offset
+  src_tok_idx = cache_end + new_tok_offset
   src_chunk_idx = src_tok_idx // num_lanes
   src_rel = src_tok_idx % num_lanes
 
@@ -82,7 +72,7 @@ def _stitch_decode_lane(
 def _stitch_prefill_lane(
     vmem_u32_ref: jax.Array,
     bkv_sz_cache: jax.Array,
-    cache_pages: jax.Array,
+    cache_end: jax.Array,
     new_tok_offset: jax.Array,
     v_len: int,
     *,
@@ -114,7 +104,7 @@ def _stitch_prefill_lane(
   src_win_len = utils.align_to(cfgs.bkv_sz, num_lanes) + num_lanes
   assert src_win_len <= v_len, (src_win_len, v_len)
 
-  src_tok = cache_pages * cfgs.serve.page_size + new_tok_offset
+  src_tok = cache_end + new_tok_offset
   src_base = (src_tok // num_lanes) * num_lanes
   src_base = pl.multiple_of(
       jnp.minimum(src_base, v_len - src_win_len), num_lanes
@@ -135,9 +125,6 @@ def _stitch_prefill_lane(
 
 
 
-# ==============================================================================
-# ==============================================================================
-
 def store_new_kv_lane(
     vmem_ref: jax.Ref,
     b_idx: int,
@@ -146,24 +133,18 @@ def store_new_kv_lane(
     cfgs: configs.MlaConfigs,
 ):
   """Stores the result of stitch_new_kv_lane back into memory."""
-
   vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
   if cfgs.one_new_token:
+    # Only the boundary tile changes. Cache tiles are fetched only up to
+    # `align_to(bkv_sz_cache, tile)`, i.e. through this one, and the tile after
+    # it holds the fetched new-KV tile, which is finite HBM input.
     dst_chunk_idx, merged_dst_vreg = stitch_result
     num_lanes = pltpu.get_tpu_info().num_lanes
-    k_chunks = cfgs.serve.page_size // num_lanes
-    dst_page_start = (dst_chunk_idx // k_chunks) * k_chunks
-    for c_offset in range(k_chunks):
-      c = dst_page_start + c_offset
-      chunk_slice = pl.ds(
-          pl.multiple_of(c * num_lanes, num_lanes), num_lanes
-      )
-      existing_vreg = vmem_u32_ref[:, chunk_slice]
-      new_chunk = jax.lax.select(
-          c < dst_chunk_idx, existing_vreg, merged_dst_vreg
-      )
-      vmem_u32_ref[:, chunk_slice] = new_chunk
+    chunk_slice = pl.ds(
+        pl.multiple_of(dst_chunk_idx * num_lanes, num_lanes), num_lanes
+    )
+    vmem_u32_ref[:, chunk_slice] = merged_dst_vreg
   else:
     # Prefill now returns a window rather than the whole buffer, so the store
     # is a window store. Writing `[..., :bkv_sz]` here used to rewrite every
@@ -185,8 +166,10 @@ def stitch_new_kv_lane(
   Expects vmem_ref shape: [batch, aligned_kv_dim, cfgs.kv_vmem_lanes]
   """
   bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
-  new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.serve.page_size
-  cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
+  # The new-KV fetch is widened down to a lane tile and lands at `cache_end`,
+  # the end of the cached tiles.
+  new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.kv_token_align
+  cache_end = utils.align_to(bkv_sz_cache, cfgs.kv_token_align)
 
   v_len = cfgs.kv_vmem_lanes
   vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
@@ -195,7 +178,7 @@ def stitch_new_kv_lane(
     return _stitch_decode_lane(
         vmem_u32_ref,
         bkv_sz_cache,
-        cache_pages,
+        cache_end,
         new_tok_offset,
         v_len,
         cfgs=cfgs,
@@ -204,7 +187,7 @@ def stitch_new_kv_lane(
     return _stitch_prefill_lane(
         vmem_u32_ref,
         bkv_sz_cache,
-        cache_pages,
+        cache_end,
         new_tok_offset,
         v_len,
         cfgs=cfgs,

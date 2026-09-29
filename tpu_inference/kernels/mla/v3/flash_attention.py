@@ -213,14 +213,10 @@ def flash_attention_pv(
   if cfgs.serve.p_same_dtype_as_v:
     p = p.astype(v.dtype)
 
-  # p: [b, n_q, s]. Contract s against v's token axis, which is dim 2 under
-  # SEQ_ALONG_LANE ([b, d_nope, s])
-  # ([b, s, d_nope]). Result is [b, n_q, d_nope] either way.
   pv = lax.dot(
       p,
       v,
-      dimension_numbers=(([2], [2]),
-                         ([0], [0])),
+      dimension_numbers=(([2], [2]), ([0], [0])),
       preferred_element_type=jnp.float32,
   )
   if cfgs.serve.scale_v is not None:

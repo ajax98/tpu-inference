@@ -15,8 +15,8 @@
 """Pallas BufferedRef overrides for Batched MLA DMA pipelines.
 
   - KVBufferedRefSeqAlongLane: Handles transposed [C_kv, K_pe] cache with dual new KV inputs.
-  - BatchingQRef: combined query [Q_nope, Q_pe], one buffer and one
-      DMA stream rather than two.
+  - BatchingQNopeRef: Non-positional query (d_nope = 512).
+  - BatchingQPeRef: Decoupled RoPE query (d_pe = 64).
   - BatchingORef: Output activations (d_nope = 512).
 """
 
@@ -37,33 +37,6 @@ if hasattr(pltpu, "BufferType"):
   BufferType = pltpu.BufferType
 else:  # jax < 0.11
   from jax._src.pallas.mosaic.pipeline import BufferType  # pylint: disable=g-import-not-at-top
-
-
-def _tok_slice(ref, idx, off, sz, *, dim=slice(None)):
-  """Slice `sz` tokens starting at `off` from a paged or batched KV ref.
-
-  The token axis is minormost, so this is a lane slice. `dim` selects the
-  latent/RoPE half on the other axis.
-  """
-  return ref.at[idx, dim, pl.ds(off, sz)]
-
-
-def _tok_slice_2d(ref, off, sz):
-  """Same, for the un-paged [kv_dim, tokens] new-KV refs."""
-  return ref.at[:, pl.ds(off, sz)]
-
-
-def _kv_wait_region(window_ref, cfgs, n_tokens):
-  """The u32 view and slice covering `n_tokens` tokens of the KV staging buffer.
-
-  Waiting on a DMA means describing the bytes that must have landed. The buffer
-  flattens to [kv_dim/packing, tokens] and the token count slices the minor
-  axis.
-  """
-  u32 = window_ref.bitcast(jnp.uint32)
-  flat = u32.reshape((-1, cfgs.kv_vmem_lanes))
-  rows = cfgs.aligned_kv_dim // cfgs.serve.packing_kv
-  return flat.at[:rows, pl.ds(0, n_tokens)]
 
 
 @jax.tree_util.register_dataclass
@@ -140,15 +113,15 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       src_ref: tuple[Any, Any, Any, schedule.MlaSchedule, Any],
       grid_indices: tuple[int | jax.Array, ...],
   ):
-    # src_ref: (kv_cache_hbm, new_kv_c_hbm, new_k_pe_hbm, schedule_ref, page_indices_ref)
+    # src_ref: (kv_cache_hbm, new_kv_c_hbm, new_k_pe_hbm, schedule_ref,
+    #           kv_finite_ref)
     (
         kv_cache_hbm,
         new_kv_c_hbm,
         new_k_pe_hbm,
         schedule_ref,
-        page_indices_ref,
+        kv_finite_ref,
     ) = src_ref
-    del page_indices_ref
 
     slot = self.current_copy_in_slot
     assert self.sem_recvs is not None
@@ -164,62 +137,136 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       # 1. Fetch cached paged tokens from 3D HBM cache
       with jax.named_scope("fetch_paged_kv_cache"):
         for i in range(self.cfgs.bkv_p_cache):
-          hbm_p_idx, dma_valid = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-          # Compile-time constant: page i of the block lands at i * page_size.
+          hbm_p_idx, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
           dst_off = i * self.cfgs.serve.page_size
-          sz = jnp.where(dma_valid == 1, self.cfgs.serve.page_size, 0)
-          sz = pl.multiple_of(sz, num_lanes)
 
           # C_kv [:aligned_lkv_dim] and K_pe [aligned_lkv_dim:] are adjacent
           # and share source and destination lane slices, so one copy is
           # identical to the two below and halves the descriptor count.
-          def _start_cache(hbm_p_idx=hbm_p_idx, dst_off=dst_off, sz=sz, b=b):
+          @pl.when(sz > 0)
+          def _start_paged_kv(hbm_p_idx=hbm_p_idx, dst_off=dst_off, sz=sz, b=b):
+            sz = pl.multiple_of(sz, num_lanes)
             pltpu.make_async_copy(
-                _tok_slice(kv_cache_hbm, hbm_p_idx, 0, sz),
-                _tok_slice(vmem_dst_lane, b, dst_off, sz),
+                kv_cache_hbm.at[hbm_p_idx, :, pl.ds(0, sz)],
+                vmem_dst_lane.at[b, :, pl.ds(dst_off, sz)],
+                sem,
+            ).start()
+      # 2. Fetch unpaged new KV tokens from HBM. They are contiguous in both
+      # the HBM input and VMEM, so entry 0 carries one coalesced fetch.
+      with jax.named_scope("fetch_new_kv"):
+        dma_entry = schedule_ref.dma_kv_new[block_idx, b, 0]
+        fetch_sz = dma_entry.fetch_val
+
+        @pl.when(fetch_sz > 0)
+        def _start_new_kv(dma_entry=dma_entry, sz=fetch_sz, b=b):
+          src_new_off = pl.multiple_of(dma_entry.fetch_hbm[...], num_lanes)
+          dst_vmem_off = pl.multiple_of(dma_entry.fetch_vmem[...], num_lanes)
+          sz = pl.multiple_of(sz, num_lanes)
+
+          # new_kv_c_hbm -> vmem_dst_lane[:aligned_lkv_dim, :] (C_kv)
+          with jax.named_scope("fetch_new_kv_c"):
+            pltpu.make_async_copy(
+                new_kv_c_hbm.at[:, pl.ds(src_new_off, sz)],
+                vmem_dst_lane.at[b, :aligned_lkv_dim, pl.ds(dst_vmem_off, sz)],
                 sem,
             ).start()
 
-          _start_cache()
-      # 2. Fetch unpaged new KV tokens from HBM
-      with jax.named_scope("fetch_new_kv"):
-        for i in range(self.cfgs.bkv_p_new):
-          dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-          src_new_off = dma_entry.fetch_hbm[...]
-          dst_vmem_off = dma_entry.fetch_vmem[...]
-          sz = jnp.where(dma_entry.fetch_val == 1, self.cfgs.serve.page_size, 0)
-          src_new_off = pl.multiple_of(src_new_off, num_lanes)
-          dst_vmem_off = pl.multiple_of(dst_vmem_off, num_lanes)
-          sz = pl.multiple_of(sz, num_lanes)
+          # new_k_pe_hbm -> vmem_dst_lane[aligned_lkv_dim:, :] (K_pe).
+          with jax.named_scope("fetch_new_k_pe"):
+            pltpu.make_async_copy(
+                new_k_pe_hbm.at[:, pl.ds(src_new_off, sz)],
+                vmem_dst_lane.at[b, aligned_lkv_dim:, pl.ds(dst_vmem_off, sz)],
+                sem,
+            ).start()
 
-          # Gating these on `fetch_val` -- only one step in three carries a
-          # new token at bkv=3 over 9 pages -- was measured and is a null
-          # result: bit-identical output, and the per-step deficit against v2
-          # was unchanged (+11.4/+6.7/+2.5 us ungated vs +11.5/+6.5/+2.6
-          # gated, at 48/24/12 steps). Zero-size DMAs are free to issue; the
-          # per-step cost is elsewhere.
-          def _start_new_kv(
-              src_new_off=src_new_off, dst_vmem_off=dst_vmem_off, sz=sz, b=b
-          ):
-            # new_kv_c_hbm -> the C_kv half of the staging buffer
-            with jax.named_scope("fetch_new_kv_c"):
-              pltpu.make_async_copy(
-                  _tok_slice_2d(new_kv_c_hbm, src_new_off, sz),
-                  _tok_slice(vmem_dst_lane, b, dst_vmem_off, sz,
-                             dim=slice(None, aligned_lkv_dim)),
-                  sem,
-              ).start()
+    # 3. Zero what those DMAs leave uncovered, the first time each (slot, lane)
+    # is used. Every lane's DMAs are already in flight, so this overlaps them.
+    self._zero_uncovered_on_first_use(
+        schedule_ref, kv_finite_ref, slot, block_idx, vmem_dst_lane
+    )
 
-            # new_k_pe_hbm -> the K_pe half.
-            with jax.named_scope("fetch_new_k_pe"):
-              pltpu.make_async_copy(
-                  _tok_slice_2d(new_k_pe_hbm, src_new_off, sz),
-                  _tok_slice(vmem_dst_lane, b, dst_vmem_off, sz,
-                             dim=slice(aligned_lkv_dim, None)),
-                  sem,
-              ).start()
+  def _zero_uncovered_on_first_use(
+      self,
+      schedule_ref: schedule.MlaSchedule,
+      kv_finite_ref: Any,
+      slot: jax.Array,
+      block_idx: jax.Array,
+      vmem_dst_lane: Any,
+  ):
+    """Zeroes the V rows a step's DMAs leave uncovered, once per (slot, lane).
 
-          _start_new_kv()
+    Attention computes over every column of `[0, hi)`. Masked columns get
+    `p == 0` in P @ V, but `0 * NaN` is NaN and never-written VMEM may hold NaN
+    fp8 bytes, so the V rows there must be finite. The K rows need nothing:
+    masked scores are replaced with `mask_value` before the running max. The
+    stitch only moves bits (u32 roll and select), so it cannot spread a NaN.
+
+    A valid lane's DMAs cover a lane-tile-aligned prefix `[0, covered)`: cache
+    page `i` lands at `i * page_size` with its token count rounded up to the
+    tile, so the cached tiles end at `align_to(bkv_sz_cache, tile)`; the one
+    new-KV fetch starts exactly there; and tile 0 is always one of them.
+    Zeroing only `[covered, hi)` therefore never races an in-flight DMA.
+    Afterwards every column of `[0, hi)` holds DMA'd, zeroed or stitched data,
+    and later steps only overwrite a prefix with finite data, so each
+    (slot, lane) needs this once per kernel. `kv_finite_ref` records which ones
+    are done.
+
+    Padding lanes (`s_idx == -1`) are skipped. Nothing is DMA'd into or out of
+    them, and they only occur after every real lane of the last step, so what
+    they compute cannot reach a real output through the online-softmax chain.
+
+    Args:
+      schedule_ref: The SMEM schedule for the current chunk.
+      kv_finite_ref: SMEM flags, one per (slot, lane), indexed
+        `slot * batch_size + lane`. Must be zeroed at kernel start.
+      slot: The physical buffer slot this step's DMAs target.
+      block_idx: The step being fetched.
+      vmem_dst_lane: The window of `slot`, [batch_size, aligned_kv_dim, lanes].
+    """
+    cfgs = self.cfgs
+    page_size = cfgs.serve.page_size
+    tile = cfgs.kv_token_align
+    # Decode only reads [0, bkv_sz); the prefill stitch rolls the whole lane,
+    # so it needs the slack past bkv_sz as well.
+    hi = cfgs.bkv_sz if cfgs.one_new_token else cfgs.kv_vmem_lanes
+    if hi <= tile:
+      return
+    v_rows = cfgs.aligned_lkv_dim
+    slot = jax.lax.convert_element_type(slot, jnp.int32)
+
+    for b in range(cfgs.batch_size):
+      flag_idx = slot * cfgs.batch_size + b
+      is_real_lane = schedule_ref.s_idx[block_idx, b] != -1
+      first_use = kv_finite_ref[flag_idx] == 0
+
+      @pl.when(is_real_lane & first_use)
+      @jax.named_scope("zero_uncovered_kv")
+      def _zero_lane(b=b, flag_idx=flag_idx):
+        covered = jnp.int32(0)
+        for i in range(cfgs.bkv_p_cache):
+          _, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+          covered = jnp.maximum(
+              covered, jnp.where(sz > 0, i * page_size + sz, 0)
+          )
+        dma_entry = schedule_ref.dma_kv_new[block_idx, b, 0]
+        fetch_sz = dma_entry.fetch_val
+        covered = jnp.maximum(
+            covered,
+            jnp.where(fetch_sz > 0, dma_entry.fetch_vmem[...] + fetch_sz, 0),
+        )
+
+        # `covered` is a tile multiple, so the tiles at or past it are exactly
+        # [covered, hi). A loop over just those tiles costs nothing when the
+        # DMAs cover everything, where a static branch per tile would still
+        # evaluate every branch. Tile 0 is always covered.
+        @pl.loop(jnp.maximum(covered // tile, 1), hi // tile)
+        def _zero_tile(t, b=b):
+          start = pl.multiple_of(t * tile, tile)
+          vmem_dst_lane[b, :v_rows, pl.ds(start, tile)] = jnp.zeros(
+              (v_rows, tile), vmem_dst_lane.dtype
+          )
+
+        kv_finite_ref[flag_idx] = 1
 
   def copy_out(
       self,
@@ -227,9 +274,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       grid_indices: tuple[int | jax.Array, ...],
   ):
     with jax.named_scope("kv_copy_out"):
-      # dst_ref: (kv_out_ref, _, _, schedule_ref, page_indices_ref)
-      kv_out_ref, _, _, schedule_ref, page_indices_ref = dst_ref
-      del page_indices_ref
+      # dst_ref: (kv_out_ref, _, _, schedule_ref, kv_finite_ref)
+      kv_out_ref, _, _, schedule_ref, _ = dst_ref
       slot = self.current_copy_out_slot
       assert self.sem_sends is not None
       sem: Any = self.sem_sends.at[slot]
@@ -244,25 +290,25 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
         for i in range(self.cfgs.bkv_p_new):
           dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-          hbm_p_idx = dma_entry.wb_hbm[...]
-          src_vmem_off = dma_entry.wb_vmem[...]
-          dma_valid = dma_entry.wb_val
-          sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
-          src_vmem_off = pl.multiple_of(src_vmem_off, num_lanes)
-          sz = pl.multiple_of(sz, num_lanes)
+          wb_sz = dma_entry.wb_val
 
           # Write back concatenated into 3D kv_out_ref. Same adjacency argument
           # as `copy_in`: one copy covers both halves.
-          def _start_wb(
-              hbm_p_idx=hbm_p_idx, src_vmem_off=src_vmem_off, sz=sz, b=b
-          ):
+          @pl.when(do_writeback & (wb_sz > 0))
+          def _start_wb(dma_entry=dma_entry, sz=wb_sz, b=b):
+            # wb_hbm packs (physical_page << page_size_log2) | offset_in_page.
+            encoded = dma_entry.wb_hbm[...]
+            hbm_p_idx = encoded >> self.cfgs.serve.page_size_log2
+            dst_off = pl.multiple_of(
+                encoded & self.cfgs.serve.page_size_mask, num_lanes
+            )
+            src_vmem_off = pl.multiple_of(dma_entry.wb_vmem[...], num_lanes)
+            sz = pl.multiple_of(sz, num_lanes)
             pltpu.make_async_copy(
-                _tok_slice(vmem_src_lane, b, src_vmem_off, sz),
-                _tok_slice(kv_out_ref, hbm_p_idx, 0, sz),
+                vmem_src_lane.at[b, :, pl.ds(src_vmem_off, sz)],
+                kv_out_ref.at[hbm_p_idx, :, pl.ds(dst_off, sz)],
                 sem,
             ).start()
-
-          _start_wb()
 
   def wait_in(
       self,
@@ -276,18 +322,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       sem: Any = self.sem_recvs.at[slot]
       block_idx = grid_indices[0]
 
-      # The schedule already summed this when it built the descriptors. This
-      # used to re-derive it from batch_size * (bkv_p_cache + bkv_p_new) SMEM
-      # reads on every grid step -- 16 at batch=4, bkv=3 -- which is per-step
-      # work v2 does not do, and the deficit against v2 is per-grid-step.
-      kv_in_tokens = pl.multiple_of(
-          jnp.asarray(schedule_ref.total_wait_kv_in[block_idx]), 128
-      )
+      kv_in_tokens = schedule_ref.total_wait_kv_in[block_idx]
+      kv_in_tokens = pl.multiple_of(jnp.asarray(kv_in_tokens), 128)
 
       assert self.window_ref is not None
       vmem_dst: Any = self.window_ref.at[slot]
-      region = _kv_wait_region(vmem_dst, self.cfgs, kv_in_tokens)
-      pltpu.make_async_copy(region, region, sem).wait()
+      vmem_u32 = vmem_dst.bitcast(jnp.uint32)
+      minor = self.cfgs.kv_vmem_lanes
+      flat_dst = vmem_u32.reshape((-1, minor))
+      sublanes = self.cfgs.aligned_kv_dim // self.cfgs.serve.packing_kv
+      pltpu.make_async_copy(
+          flat_dst.at[:sublanes, pl.ds(0, kv_in_tokens)],
+          flat_dst.at[:sublanes, pl.ds(0, kv_in_tokens)],
+          sem,
+      ).wait()
 
   def wait_out(
       self,
@@ -301,19 +349,24 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
       sem: Any = self.sem_sends.at[slot]
       block_idx = grid_indices[0]
 
-      # As in `wait_in`: precomputed by the schedule.
-      kv_out_tokens = pl.multiple_of(
-          jnp.asarray(schedule_ref.total_wait_kv_out[block_idx]), 128
-      )
+      kv_out_tokens = schedule_ref.total_wait_kv_out[block_idx]
+      kv_out_tokens = pl.multiple_of(jnp.asarray(kv_out_tokens), 128)
 
       assert self.window_ref is not None
       vmem_src: Any = self.window_ref.at[slot]
-      region = _kv_wait_region(vmem_src, self.cfgs, kv_out_tokens)
-      pltpu.make_async_copy(region, region, sem).wait()
+      vmem_u32 = vmem_src.bitcast(jnp.uint32)
+      minor = self.cfgs.kv_vmem_lanes
+      flat_src = vmem_u32.reshape((-1, minor))
+      sublanes = self.cfgs.aligned_kv_dim // self.cfgs.serve.packing_kv
+      pltpu.make_async_copy(
+          flat_src.at[:sublanes, pl.ds(0, kv_out_tokens)],
+          flat_src.at[:sublanes, pl.ds(0, kv_out_tokens)],
+          sem,
+      ).wait()
 
 
 # ==============================================================================
-# Dedicated Query BufferedRef (BatchingQRef)
+# Dedicated Query BufferedRefs (BatchingQNopeRef & BatchingQPeRef)
 # ==============================================================================
 
 
@@ -335,9 +388,6 @@ class BatchingQRef(pltpu.BufferedRef):
       cfgs: configs.MlaConfigs,
       **kwargs,
   ) -> "BatchingQRef":
-    # `BufferType` rather than `pltpu.BufferType`: jax 0.9.2, which the serving
-    # stack pins, has not promoted it to the public namespace yet. See the
-    # shim at the top of this module.
     assert buffer_type == BufferType.INPUT
 
     standard_ref = pltpu.BufferedRef.create(
@@ -396,8 +446,6 @@ class BatchingQRef(pltpu.BufferedRef):
     sem: Any = self.sem_recvs.at[slot]
     block_idx = grid_indices[0]
 
-    # Summed by the schedule when it built the q descriptors; this loop
-    # re-read `batch_size` of them on every grid step.
     q_in_tokens = schedule_ref.total_wait_q_in[block_idx]
 
     itemsize = jnp.dtype(self.cfgs.serve.dtype_q).itemsize
@@ -510,7 +558,6 @@ class BatchingORef(pltpu.BufferedRef):
     )
     rows_per_token = o_bytes_per_token // (minor * 4)
     assert rows_per_token % 8 == 0
-    # As above: precomputed by the schedule.
     o_tokens = schedule_ref.total_wait_o_out[block_idx]
     wait_lanes = o_tokens * rows_per_token
     assert self.window_ref is not None
