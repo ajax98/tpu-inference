@@ -23,6 +23,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 import tpu_inference.envs as envs
 import tpu_inference.kernels.mla.v2.kernel as mla
+import tpu_inference.kernels.mla.v3.utils as mla_v3_utils
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 
 if envs.USE_BATCHED_RPA_KERNEL:
@@ -31,6 +32,7 @@ else:
     import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
 
 from tpu_inference import utils
+from tpu_inference.kernels.mla import version as mla_version
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
@@ -78,15 +80,22 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
     if use_mla:
         # No assertion needed: MLA compresses all KV into a single latent vector,
         # so actual_num_kv_heads is never used in mla.get_kv_cache_shape().
-        get_kv_cache_shape_fn = mla.get_kv_cache_shape
-        shape = list(
-            get_kv_cache_shape_fn(
-                total_num_pages,
-                physical_block_size,
-                actual_head_dim,
-                kv_dtype,
-                envs.MLA_KV_PACKING_SIZE,
-                transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE))
+        if mla_version.use_v3():
+            # v3 puts tokens on lanes: [pages, align_to(kv_dim, 128), page_size].
+            # See kernels/mla/version.py.
+            shape = list(
+                mla_v3_utils.get_kv_cache_shape(total_num_pages,
+                                                physical_block_size,
+                                                actual_head_dim, kv_dtype))
+        else:
+            shape = list(
+                mla.get_kv_cache_shape(
+                    total_num_pages,
+                    physical_block_size,
+                    actual_head_dim,
+                    kv_dtype,
+                    envs.MLA_KV_PACKING_SIZE,
+                    transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE))
     else:
         assert actual_num_kv_heads % model_cnt == 0
         get_kv_cache_shape_fn = (
@@ -178,9 +187,16 @@ def create_kv_caches(
     # block_size --> shard by context
     # head       --> shard by heads
     if use_mla:
-        sharding = NamedSharding(
-            mesh,
-            PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT))
+        if mla_version.use_v3():
+            # v3's cache is [pages, kv_dim, page_size]: the token axis is minor,
+            # so KV_CONTEXT shards dim 2. Sharding dim 1 would split the latent
+            # dimension instead of the sequence.
+            mla_spec = PartitionSpec(ShardingAxisName.BATCH, None,
+                                     ShardingAxisName.KV_CONTEXT)
+        else:
+            mla_spec = PartitionSpec(ShardingAxisName.BATCH,
+                                     ShardingAxisName.KV_CONTEXT)
+        sharding = NamedSharding(mesh, mla_spec)
     else:
         sharding = NamedSharding(
             mesh,
