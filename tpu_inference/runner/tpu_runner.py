@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import functools
+import json
 import logging
+import os
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -148,6 +151,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         return self._model_runner_output
 
+
+# Per-step JSONL log for E2E variance analysis; off when unset.
+_STEP_LOG_DIR = os.getenv("TPU_STEP_LOG_DIR", "")
 
 @dataclass
 class AsyncPreResults:
@@ -769,11 +775,53 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                "after execute_model() returns None.")
         reqs = self.input_batch.num_reqs
         toks = scheduler_output.total_num_scheduled_tokens
+        t0 = time.monotonic()
         with jax.set_mesh(self.mesh), jax.profiler.TraceAnnotation(
                 f"execute_model: {reqs} reqs, {toks} toks"):
             output = self._execute_model(scheduler_output,
                                          intermediate_tensors)
+        if _STEP_LOG_DIR and toks:
+            self._log_step(scheduler_output, t0, time.monotonic())
         return output
+
+    def _log_step(self, scheduler_output, t0: float, t1: float) -> None:
+        """Appends one JSON line per step to $TPU_STEP_LOG_DIR.
+
+        With async scheduling the host returns before the device finishes, so
+        host_ms is dispatch time only. period_ms, the gap between consecutive
+        step starts, is what tracks device step time in steady state.
+        """
+        if getattr(self, "_step_log", None) is None:
+            os.makedirs(_STEP_LOG_DIR, exist_ok=True)
+            self._step_log = open(
+                os.path.join(_STEP_LOG_DIR, f"steps-{os.getpid()}.jsonl"),
+                "a",
+                buffering=1 << 20)
+            self._step_prev_t0 = None
+            self._step_n = 0
+        sched = scheduler_output.num_scheduled_tokens.values()
+        n_decode = sum(1 for n in sched if n == 1)
+        n_prefill = len(scheduler_output.num_scheduled_tokens) - n_decode
+        n = self.input_batch.num_reqs
+        ctx = self.input_batch.num_computed_tokens_cpu[:n]
+        rec = {
+            "t": round(time.time(), 4),
+            "period_ms": (round((t0 - self._step_prev_t0) * 1e3, 3)
+                          if self._step_prev_t0 is not None else None),
+            "host_ms": round((t1 - t0) * 1e3, 3),
+            "toks": scheduler_output.total_num_scheduled_tokens,
+            "reqs": n,
+            "n_decode": n_decode,
+            "n_prefill": n_prefill,
+            "n_new": len(scheduler_output.scheduled_new_reqs),
+            "ctx_sum": int(ctx.sum()) if n else 0,
+            "ctx_max": int(ctx.max()) if n else 0,
+        }
+        self._step_prev_t0 = t0
+        self._step_log.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._step_n += 1
+        if self._step_n % 128 == 0:
+            self._step_log.flush()
 
     def sample_tokens(
         self,
