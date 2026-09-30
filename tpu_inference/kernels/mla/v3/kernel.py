@@ -564,6 +564,14 @@ def _mla_ragged_paged_attention_kernel(
       cu_q_lens, (0, aligned_cu_q_len - cu_q_lens.shape[0])
   )
   kv_lens_padded = jnp.pad(kv_lens, (0, aligned_kv_len - kv_lens.shape[0]))
+  # The schedule kernel already emits `actual_steps` into SMEM. Constraining the
+  # operand keeps XLA from staging it through HBM before this kernel starts.
+  schedule_hbm = dataclasses.replace(
+      schedule_hbm,
+      actual_steps=pltpu.with_memory_space_constraint(
+          schedule_hbm.actual_steps, pltpu.SMEM
+      ),
+  )
 
   def ragged_paged_attention_pipeline(
       # Inputs.
@@ -585,13 +593,8 @@ def _mla_ragged_paged_attention_kernel(
         cache_kv_hbm_ref, ql_nope_hbm_ref, q_pe_hbm_ref, o_hbm_ref, cfgs
     )
 
-    is_decode = cfgs.mode == configs.MlaCase.DECODE
-    if is_decode:
-      static_steps = max(1, min(cfgs.max_steps_ub, cfgs.max_steps_needed))
-      num_safe_step_iterations = 1
-    else:
-      actual_steps = schedule_hbm_ref.actual_steps[0]
-      num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
+    actual_steps = schedule_hbm_ref.actual_steps[0]
+    num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
 
     sched_template = schedule.MlaSchedule.create_shape_dtype(cfgs)
 
@@ -658,28 +661,23 @@ def _mla_ragged_paged_attention_kernel(
           copy_q.start()
           copy_kv.start()
 
-        flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-        flat_smem = jax.tree_util.tree_leaves(schedule_ref)
         total_words = 0
-        for h, s in zip(flat_hbm, flat_smem):
-          if jax.typeof(h).memory_space == pltpu.HBM and s.shape[0] > 1:
-            element_size = s.shape[0] // cfgs.max_steps_ub
-            if is_decode:
-              read_size = utils.align_to(element_size * static_steps, 128)
-              src_off = 0
-            else:
-              read_size = element_size * (num_steps + prefix_steps)
-              read_size = utils.align_to(read_size, 128)
-              read_size = jnp.minimum(read_size, s.shape[0])
-              src_off = pl.multiple_of(element_size * aligned_start_step, 128)
+        for h, s in zip(
+            schedule_hbm_ref.step_leaves(), schedule_ref.step_leaves()
+        ):
+          element_size = s.shape[0] // cfgs.max_steps_ub
+          read_size = element_size * (num_steps + prefix_steps)
+          read_size = utils.align_to(read_size, 128)
+          read_size = jnp.minimum(read_size, s.shape[0])
+          src_off = pl.multiple_of(element_size * aligned_start_step, 128)
 
-            copy = pltpu.make_async_copy(
-                h.at[pl.ds(src_off, read_size)],
-                s.at[pl.ds(0, read_size)],
-                dma_sem.at[0],
-            )
-            copy.start()
-            total_words += read_size
+          copy = pltpu.make_async_copy(
+              h.at[pl.ds(src_off, read_size)],
+              s.at[pl.ds(0, read_size)],
+              dma_sem.at[0],
+          )
+          copy.start()
+          total_words += read_size
 
         total_words = pl.multiple_of(jnp.asarray(total_words), 128)
         extra_lens_words = jnp.where(
@@ -730,25 +728,15 @@ def _mla_ragged_paged_attention_kernel(
 
       @pl.loop(0, num_safe_step_iterations)
       def loop_body(step_idx):
-        if is_decode:
-          execute_schedule_chunk(0, static_steps)
-        else:
-          start = step_idx * cfgs.max_steps_ub
-          rem = actual_steps % cfgs.max_steps_ub
-          last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
-          is_last_step = step_idx == num_safe_step_iterations - 1
-          size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+        start = step_idx * cfgs.max_steps_ub
+        rem = actual_steps % cfgs.max_steps_ub
+        last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+        is_last_step = step_idx == num_safe_step_iterations - 1
+        size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
-          execute_schedule_chunk(start, size)
+        execute_schedule_chunk(start, size)
 
     _run()
-
-  if cfgs.mode == MlaCase.DECODE:
-    # Decode runs a static `max_steps_needed` and never reads `actual_steps`.
-    # XLA passes an s32[1] custom-call operand by value, so keeping it costs a
-    # blocking HBM round trip (DMA to VMEM, wait, vpush/spop) right before the
-    # kernel starts, whatever its BlockSpec memory space. Drop it.
-    schedule_hbm = dataclasses.replace(schedule_hbm, actual_steps=None)  # pytype: disable=bad-argument-type
 
   num_pre_leaves = 2  # cu_q_lens, kv_lens, page_indices
   num_sched_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))

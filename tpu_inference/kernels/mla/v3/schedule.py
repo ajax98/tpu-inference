@@ -188,6 +188,13 @@ class SmemArrayOfStructs(SmemWrapper):
     return self.struct_cls(self.data, pos_start)
 
 
+# `actual_steps` is padded to one 128-word SMEM tile. It is the only schedule
+# leaf kept in SMEM (see `MlaSchedule.in_specs`/`out_specs`): the schedule kernel
+# writes it straight into an SMEM output and the attention kernel takes that
+# buffer as an SMEM operand, so reading it costs no HBM->SMEM copy.
+ACTUAL_STEPS_WORDS = 128
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MlaSchedule:
@@ -205,7 +212,7 @@ class MlaSchedule:
   total_wait_kv_out: SmemWrapper  # [steps]
   total_wait_q_in: SmemWrapper  # [steps]
   total_wait_o_out: SmemWrapper  # [steps]
-  actual_steps: jax.Array  # [1]
+  actual_steps: jax.Array  # [ACTUAL_STEPS_WORDS], only word 0 is used.
 
   cfgs: configs.MlaConfigs = dataclasses.field(metadata=dict(static=True))
 
@@ -239,14 +246,19 @@ class MlaSchedule:
         total_wait_kv_out=steps_wrapper,
         total_wait_q_in=steps_wrapper,
         total_wait_o_out=steps_wrapper,
-        actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),  # pytype: disable=bad-argument-type
+        actual_steps=jax.ShapeDtypeStruct((ACTUAL_STEPS_WORDS,), jnp.int32),  # pytype: disable=bad-argument-type
         cfgs=cfgs,
+    )
+
+  def step_leaves(self) -> list[Any]:
+    """Leaves indexed by step and stored in HBM: all but `actual_steps`."""
+    return jax.tree_util.tree_leaves(
+        dataclasses.replace(self, actual_steps=None)
     )
 
   @property
   def total_hbm_words(self) -> int:
-    leaves = jax.tree_util.tree_leaves(self)
-    return sum(int(leaf.shape[0]) for leaf in leaves if leaf.size > 1)
+    return sum(int(leaf.shape[0]) for leaf in self.step_leaves())
 
   def get_dma_kv_cache(
       self,
@@ -270,17 +282,23 @@ class MlaSchedule:
   def scratch_shapes(self):
     return jax.tree.map(lambda x: pltpu.SMEM(x.shape, x.dtype), self)
 
+  def memory_spaces(self):
+    """HBM for the per-step leaves, SMEM for `actual_steps`."""
+    spaces = jax.tree.map(lambda _: pltpu.HBM, self)
+    return dataclasses.replace(spaces, actual_steps=pltpu.SMEM)
+
   def in_specs(self):
-    def wrapper(x):
-      if x.size == 1:
-        if self.cfgs.mode == configs.MlaCase.DECODE:
-          return pl.BlockSpec(memory_space=pltpu.HBM)
-        return pl.BlockSpec(memory_space=pltpu.SMEM)
-      return pl.BlockSpec(memory_space=pltpu.HBM)
-    return jax.tree.map(wrapper, self)
+    return jax.tree.map(
+        lambda space: pl.BlockSpec(memory_space=space), self.memory_spaces()
+    )
 
   def out_specs(self):
-    return jax.tree.map(lambda x: pl.BlockSpec(memory_space=pltpu.HBM), self)
+    return self.in_specs()
+
+  def out_shape(self):
+    return jax.tree.map(
+        lambda x, space: space(x.shape, x.dtype), self, self.memory_spaces()
+    )
 
 # --- Scheduler Computation Core ---
 
@@ -353,8 +371,8 @@ def _write_schedule_to_hbm(
   to one chunk, the chunk shrinks to fit and the loop disappears.
   """
   hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)  # pytype: disable=bad-argument-type
-  flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
-  flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+  flat_hbm = schedule_hbm.step_leaves()
+  flat_smem = schedule_smem.step_leaves()
 
   # At least one step: the final flush is traced even for a zero-token shape,
   # where `max_steps_needed` is 0, although `count > 0` never lets it run.
@@ -365,8 +383,6 @@ def _write_schedule_to_hbm(
   def chunk_copies(chunk_idx):
     copies = []
     for h, s in zip(flat_hbm, flat_smem):
-      if h.shape[0] == 1:  # `actual_steps`, copied separately below.
-        continue
       element_size = s.shape[0] // cfgs.max_steps_ub
       chunk_size = utils.align_to(chunk_steps * element_size, 128)
       src_offset = chunk_idx * chunk_size
@@ -383,16 +399,6 @@ def _write_schedule_to_hbm(
           )
       )
     return copies
-
-  scalar_copies = [
-      pltpu.make_async_copy(
-          s.at[pl.ds(0, 1)], h.at[pl.ds(0, 1)], dma_sem.at[0]
-      )
-      for h, s in zip(flat_hbm, flat_smem)
-      if h.shape[0] == 1
-  ]
-  for copy in scalar_copies:
-    copy.start()
 
   if max_chunks == 1:
     copies = chunk_copies(0)
@@ -412,9 +418,6 @@ def _write_schedule_to_hbm(
     def _(chunk_idx):
       for copy in chunk_copies(chunk_idx):
         copy.wait()
-
-  for copy in scalar_copies:
-    copy.wait()
 
 
 def _compute_waits(
@@ -477,16 +480,9 @@ def flush_to_hbm(
     cfgs: configs.MlaConfigs,
 ):
   last_step = utils.align_to(count, cfgs.batch_size)
+  num_steps = last_step // cfgs.batch_size
 
-  if cfgs.mode == configs.MlaCase.DECODE:
-    static_steps = max(1, min(cfgs.max_steps_ub, cfgs.max_steps_needed))
-    mask_limit = static_steps * cfgs.batch_size
-    num_steps = static_steps
-  else:
-    mask_limit = last_step
-    num_steps = last_step // cfgs.batch_size
-
-  @pl.loop(count, mask_limit)
+  @pl.loop(count, last_step)
   @jax.named_scope("mask_out_steps")
   def body(idx):
     step, b_idx = divmod(idx, cfgs.batch_size)
@@ -728,7 +724,8 @@ def rpa_metadata_schedule_kernel(
   count = loop_carry.count
   hbm_offset = loop_carry.hbm_offset
   steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
-  schedule_ref.actual_steps[0] = steps  # pytype: disable=unsupported-operation
+  # `actual_steps` is an SMEM output, so a scalar store is all it takes.
+  schedule_hbm_ref.actual_steps[0] = steps  # pytype: disable=unsupported-operation
 
   # An empty buffer has nothing to flush, and flushing it anyway would advance
   # `hbm_offset` by another `max_steps_ub` -- past the end of the HBM schedule
@@ -743,27 +740,6 @@ def rpa_metadata_schedule_kernel(
         dma_sem,
         cfgs=cfgs,
     )
-
-  @pl.when(count == 0)
-  def _():
-    if cfgs.mode == configs.MlaCase.DECODE:
-      flush_to_hbm(
-          0,
-          schedule_ref,
-          schedule_hbm_ref,
-          hbm_offset,
-          dma_sem,
-          cfgs=cfgs,
-      )
-    else:
-      copy = pltpu.make_async_copy(
-          schedule_ref.actual_steps.at[pl.ds(0, 1)],
-          schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
-          dma_sem.at[0],
-      )
-      copy.start()
-      copy.wait()
-
 
 
 def generate_mla_metadata(
@@ -784,8 +760,8 @@ def generate_mla_metadata(
   # output buffers comes from the `out_shape` avals. Plain ShapeDtypeStructs
   # carry no memory space, so XLA was free to put the schedule in VMEM and then
   # evict it to HBM with copy-start/done pairs before the attention kernel ran.
-  # Tagging each leaf as HBM pins the outputs there.
-  out_shape = jax.tree.map(lambda x: pltpu.HBM(x.shape, x.dtype), schedule_hbm)
+  # Tagging each leaf pins the per-step leaves in HBM and `actual_steps` in SMEM.
+  out_shape = schedule_hbm.out_shape()
 
   return pl.pallas_call(
       functools.partial(rpa_metadata_schedule_kernel, cfgs=cfgs),

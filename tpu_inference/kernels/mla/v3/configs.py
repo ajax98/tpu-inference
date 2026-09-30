@@ -473,7 +473,7 @@ class MlaConfigs:
         + (self.serve.num_seqs * self.serve.pages_per_seq)  # page_indices
         + 3  # distribution [decode, prefill, total]
         + self.block.batch_size  # lane_lengths
-        + 1  # actual_steps
+        + 128  # actual_steps, padded to one SMEM tile
     ) * 4  # 4 bytes per int32
 
     smem_limit_bytes = (
