@@ -18,7 +18,6 @@ import dataclasses
 
 from absl import logging
 import jax
-from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
@@ -132,8 +131,8 @@ def mode_configs(
   `modes` selects which passes exist at all. A caller that knows a band is
   always empty can drop it here and the pass vanishes from the graph -- no
   schedule built, no kernel launched. That is strictly better than leaving it
-  in: an empty band still costs a schedule build plus either a `lax.cond` or a
-  zero-trip `pallas_call`. DECODE is assumed present.
+  in: an empty band still costs a schedule build plus a zero-trip
+  `pallas_call`. DECODE is assumed present.
   """
   actual_num_q_heads, total_q_tokens, actual_lkv_dim = ql_nope.shape
   actual_r_dim = q_pe.shape[-1]
@@ -369,10 +368,6 @@ def mla_ragged_paged_attention(
         cfgs=cfgs,
     )
 
-  num_decode = distribution[0]
-  num_prefill = distribution[1] - distribution[0]
-  num_mixed = distribution[2] - distribution[1]
-
   if debug_mode:
     logging.info(
         "Prepared inputs for MLA: ql_nope=%s, q_pe=%s, new_kv_c=%s,"
@@ -388,62 +383,16 @@ def mla_ragged_paged_attention(
   # gets its own pass, chaining `ql_nope_prep` and `cache_kv` so later passes
   # see earlier writes.
   #
-  # These used to be guarded by `lax.cond` on whether the band was non-empty,
-  # at 0.053 ms per call -- 61 layers deep that is ~3.2 ms per decode step
-  # against a ~34 ms TPOT, and it is the single largest v2/v3 difference
-  # end to end, larger than every kernel delta combined.
-  #
-  # The guard was never needed. The kernel is already zero-trip on an empty
-  # band: `num_safe_step_iterations = cdiv(actual_steps, max_steps_ub)` is 0
-  # and `pl.loop(0, 0)` runs nothing. What the cond cost was its *carry* --
-  # both branches must yield `(ql_nope, cache_kv)`, and `cache_kv` is the
-  # whole KV cache, so the conditional forced it through a select. v2 reaches
-  # the same place by sizing each pass zero-trip and paying ~0.9 us for the
-  # passes that do nothing (v2/kernel.py:2511).
-  # `distribution` splits the batch into decode / prefill / mixed bands. Each
-  # gets its own pass, chaining `ql_nope_prep` and `cache_kv` so later passes
-  # see earlier writes.
-  #
-  # The comment that used to sit here said the cond costs 0.053 ms per call
-  # and that v2 avoids it by sizing each pass zero-trip. That was taken at
-  # face value and the guard removed; measured as a before/after it is the
-  # other way round. Pure decode, kv 9216, bkv=3, batch=4, wall clock:
-  #
-  #             guard present   guard removed
-  #     8 seqs      68.8 us         74.6 us
-  #    32 seqs     155.5           163.5
-  #   112 seqs     450.3           457.4
-  #
-  # Running the two empty passes as zero-trip pallas_calls costs 6-8 us more
-  # than the conditional it replaced, at every size. v3 already beat v2 with
-  # the guard in place (-1.7 / -9.7 / -10.8%). Keep the cond.
-  # MLA_V3_COND=0 runs the passes unconditionally instead. Kept as a flag so
-  # correctness can be checked in both states without a rebuild; the cond is
-  # the default because removing it measured worse in an isolated benchmark
-  # (see the revert commit) -- though that benchmark used a ~100 MB cache
-  # against E2E's 92.9 GB, so it cannot see the carry cost.
-  # Only the passes present in `cfgs_by_mode` run; see `mode_configs(modes=)`.
-  band_nonempty = {
-      configs.MlaCase.DECODE: distribution[0] > 0,
-      configs.MlaCase.PREFILL: distribution[1] - distribution[0] > 0,
-      configs.MlaCase.MIXED: distribution[2] - distribution[1] > 0,
-  }
-  active_modes = [m for m in ALL_MODES if m in cfgs_by_mode]
-
-  import os as _os
-  if _os.environ.get("MLA_V3_COND", "1") == "1":
-    carry = (ql_nope_prep, cache_kv)
-    for mode in active_modes:
-      carry = lax.cond(
-          band_nonempty[mode],
-          lambda q_kv, m=mode: run_mla_kernel(m, q_kv[0], q_kv[1]),
-          lambda q_kv: q_kv,
-          carry,
-      )
-    o_hbm, cache_kv = carry
-  else:
-    o_hbm, cache_kv = ql_nope_prep, cache_kv
-    for mode in active_modes:
+  # The passes run unconditionally: an empty band is already zero-trip
+  # (`cdiv(actual_steps, max_steps_ub)` is 0, so `pl.loop(0, 0)` runs nothing).
+  # Guarding them with `lax.cond` looked ~6-8 us cheaper in an isolated
+  # benchmark with a ~100 MB cache, but at E2E scale the cond's carry drags the
+  # whole KV cache (92.9 GB) through a select, which was the largest v2/v3 gap
+  # end to end. Only the passes in `cfgs_by_mode` run; see
+  # `mode_configs(modes=)`.
+  o_hbm = ql_nope_prep
+  for mode in ALL_MODES:
+    if mode in cfgs_by_mode:
       o_hbm, cache_kv = run_mla_kernel(mode, o_hbm, cache_kv)
 
   output = kernel.prepare_outputs(
