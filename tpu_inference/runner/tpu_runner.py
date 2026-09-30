@@ -781,8 +781,40 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             output = self._execute_model(scheduler_output,
                                          intermediate_tensors)
         if _STEP_LOG_DIR and toks:
-            self._log_step(scheduler_output, t0, time.monotonic())
+            try:
+                self._log_step(scheduler_output, t0, time.monotonic())
+            except Exception:
+                logger.exception("step log failed")
         return output
+
+    def _step_dp_stats(self, dp_size, scheduled_tokens_per_dp_rank,
+                       req_indices_dp, padded_num_scheduled_tokens_per_dp_rank,
+                       padded_num_reqs_per_dp_rank) -> dict:
+        # Every rank runs the program padded for the busiest one, so the
+        # per-rank split is what explains a step's padded size.
+        ranks, dec_kv = [], []
+        for dp_rank in range(dp_size):
+            sched = np.asarray(scheduled_tokens_per_dp_rank[dp_rank],
+                               dtype=np.int64)
+            idx = np.asarray(req_indices_dp[dp_rank], dtype=np.int64)
+            kv = (self.input_batch.num_computed_tokens_cpu[idx] + sched
+                  if len(idx) else np.zeros(0, np.int64))
+            dec = sched == 1
+            ranks.append([
+                len(idx),
+                int(dec.sum()),
+                int(sched[~dec].sum()),
+                int(sched.sum()),
+                int(kv.max()) if len(kv) else 0,
+                int(kv.sum()),
+            ])
+            dec_kv.append(kv[dec].astype(int).tolist())
+        return {
+            "pad_tok": int(padded_num_scheduled_tokens_per_dp_rank),
+            "pad_req": int(padded_num_reqs_per_dp_rank),
+            "r": ranks,
+            "kv": dec_kv,
+        }
 
     def _log_step(self, scheduler_output, t0: float, t1: float) -> None:
         """Appends one JSON line per step to $TPU_STEP_LOG_DIR.
@@ -817,6 +849,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "ctx_sum": int(ctx.sum()) if n else 0,
             "ctx_max": int(ctx.max()) if n else 0,
         }
+        # Per DP rank, "r" is [reqs, decodes, prefill tokens, tokens,
+        # kv max, kv sum] and "kv" the raw decode kv_lens.
+        dp = getattr(self, "_step_dp", None)
+        if dp is not None:
+            rec.update(dp)
+            self._step_dp = None
         self._step_prev_t0 = t0
         self._step_log.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self._step_n += 1
@@ -1456,6 +1494,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         attn_padded_num_reqs = runner_utils.get_padded_token_len(
             self.attn_num_reqs_paddings, padded_num_reqs)
 
+        if _STEP_LOG_DIR:
+            try:
+                self._step_dp = self._step_dp_stats(
+                    dp_size, scheduled_tokens_per_dp_rank, req_indices_dp,
+                    padded_num_scheduled_tokens_per_dp_rank,
+                    padded_num_reqs_per_dp_rank)
+            except Exception:
+                logger.exception("per-rank step log failed")
+                self._step_dp = None
         # logits_indices_selector reorders per-rank outputs back to the
         # original batch ordering; with a single rank the ordering is already
         # the input-batch ordering, so no selector is needed.

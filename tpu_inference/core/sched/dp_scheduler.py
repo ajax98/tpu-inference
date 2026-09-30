@@ -15,6 +15,7 @@
 import atexit
 import copy
 import gc
+import json
 import multiprocessing
 import multiprocessing.reduction
 import os
@@ -303,6 +304,9 @@ def _scheduler_worker_process(
             error = SchedulerWorkerError(rank, str(e))
             _send_result(error)
 
+
+# Router decision log for E2E variance analysis; off when unset.
+_ROUTE_LOG_DIR = os.getenv("TPU_STEP_LOG_DIR", "")
 
 @dataclass
 class DPSchedulerOutput(SchedulerOutput):
@@ -622,6 +626,7 @@ class DPScheduler(SchedulerInterface):
                 return best_cache_rank
 
         pending = self._get_rank_pending_prefill_tokens()
+        self._last_pending = pending
         return min(pending, key=pending.get)
 
     def add_request(self, request: Request) -> None:
@@ -646,11 +651,43 @@ class DPScheduler(SchedulerInterface):
 
     def _route_and_forward_request(self, request: Request) -> None:
         """Route a single request to a DP rank and send ADD_REQUEST IPC."""
+        self._last_pending = None
         rank = self._find_best_rank_for_request(request)
+        if _ROUTE_LOG_DIR:
+            try:
+                self._log_route(request, rank)
+            except Exception:
+                logger.exception("route log failed")
         self.assigned_dp_rank[request.request_id] = rank
 
         self._send_command(rank, SchedulerCommand.ADD_REQUEST, request)
         self._get_result(rank, SchedulerCommand.ADD_REQUEST)
+
+    def _log_route(self, request: Request, rank: int) -> None:
+        """Appends one JSON line per routed request to $TPU_STEP_LOG_DIR.
+
+        "pend" is each rank's pending prefill tokens (what the router ranks
+        on) and "live" its assigned, unfinished requests (what it ignores).
+        """
+        if getattr(self, "_route_log", None) is None:
+            os.makedirs(_ROUTE_LOG_DIR, exist_ok=True)
+            self._route_log = open(os.path.join(_ROUTE_LOG_DIR,
+                                                f"route-{os.getpid()}.jsonl"),
+                                   "a",
+                                   buffering=1)
+        live = [0] * self.dp_size
+        for r in self.assigned_dp_rank.values():
+            live[r] += 1
+        pend = self._last_pending
+        rec = {
+            "t": round(time(), 4),
+            "rank": rank,
+            "prompt": request.num_prompt_tokens,
+            "pend": ([pend[r] for r in range(self.dp_size)]
+                     if pend is not None else None),
+            "live": live,
+        }
+        self._route_log.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
     def _flush_pending(self) -> None:
         """Drain the pending reqs."""
