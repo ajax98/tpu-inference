@@ -307,6 +307,14 @@ def _scheduler_worker_process(
 
 # Router decision log for E2E variance analysis; off when unset.
 _ROUTE_LOG_DIR = os.getenv("TPU_STEP_LOG_DIR", "")
+# "pending": fewest pending prefill tokens, ties to the lowest rank.
+# "live": fewest live (assigned, unfinished) requests, then fewest pending.
+# Under "pending", a refill that arrives while every rank has 0 pending always
+# lands on rank 0 whichever rank freed the slot. One rank then runs 33 decodes
+# against another's 31, and because DP ranks run one SPMD program padded for
+# the busiest rank, every rank steps at the next token bucket (32 -> 64): about
+# 17% slower per step for the rest of the wave.
+_DP_ROUTE_BY = os.getenv("TPU_DP_ROUTE_BY", "pending")
 
 @dataclass
 class DPSchedulerOutput(SchedulerOutput):
@@ -605,7 +613,8 @@ class DPScheduler(SchedulerInterface):
 
         Two-tier strategy:
         1. Prefix cache hit: assign to rank with best cache hit.
-        2. Otherwise: pick rank with the fewest pending prefill tokens.
+        2. Otherwise: pick rank with the fewest pending prefill tokens, or
+           with TPU_DP_ROUTE_BY=live the fewest live requests first.
         """
         # First, try to find a rank with prefix cache hit.
         if self.vllm_config.cache_config.enable_prefix_caching:
@@ -627,6 +636,11 @@ class DPScheduler(SchedulerInterface):
 
         pending = self._get_rank_pending_prefill_tokens()
         self._last_pending = pending
+        if _DP_ROUTE_BY == "live":
+            live = [0] * self.dp_size
+            for r in self.assigned_dp_rank.values():
+                live[r] += 1
+            return min(pending, key=lambda r: (live[r], pending[r]))
         return min(pending, key=pending.get)
 
     def add_request(self, request: Request) -> None:
